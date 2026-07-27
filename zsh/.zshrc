@@ -19,6 +19,10 @@ OS="$(uname -s)"
 # zsh files (hosts, firedancer*) can be sourced regardless of OS.
 DOTFILES_ZSH_DIR="${${(%):-%x}:A:h}"
 
+# GitHub owner of the dotfiles repo.
+DOTFILES_REPO_OWNER="tristanx86-jump"
+DOTFILES_REPO_URL="https://github.com/${DOTFILES_REPO_OWNER}/dotfiles.git"
+
 # ── macOS Configuration ──────────────────────────────
 if [[ "$OS" == "Darwin" ]]; then
     # Homebrew Setup (Apple Silicon / Intel fallback)
@@ -174,7 +178,7 @@ function flooddot() { _renderdot flood_cmds.md; }    # floodfd load-gen cmds
 
 # updatedot: pull the latest dotfiles, re-run install.sh, reload the shell.
 function updatedot() {
-    git clone https://github.com/tristanx86/dotfiles.git ~/dotfiles 2>/dev/null || (cd ~/dotfiles && git fetch && git reset --hard origin/main) && chmod +x ~/dotfiles/install.sh && ~/dotfiles/install.sh && exec zsh
+    git clone "$DOTFILES_REPO_URL" ~/dotfiles 2>/dev/null || (cd ~/dotfiles && git fetch && git reset --hard origin/main) && chmod +x ~/dotfiles/install.sh && ~/dotfiles/install.sh && exec zsh
 }
 
 # wipedot: undo install.sh — meant for fresh machines/servers. Full revert
