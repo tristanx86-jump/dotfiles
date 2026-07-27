@@ -10,9 +10,11 @@
 # `floodsd dpdk`) apt/dnf/yum.
 #
 # Load-tests a remote firedancer validator from a *separate* box: always
-# sends 64B (min-sized) UDP packets to dport 9000, sourced from port 8424 —
-# this box's egress firewall only allows outbound traffic sourced from that
-# port (see FLOOD_SPORT below). Two engines, chosen explicitly each run:
+# sends 64B (min-sized) UDP packets to dport 9000, sourced from a small range
+# of ports starting at 8424 (see FLOOD_SPORT/FLOOD_SPORT_CNT below) — rotating
+# the src port so the target's NIC hashes the flood across its RX queues / net
+# tiles. All these ports must be egress-allowed by this box's firewall. Two
+# engines, chosen explicitly each run:
 #   floodsd dpdk    DPDK pktgen (userspace, needs a NIC bound to vfio-pci/mlx5)
 #   floodsd kernel  in-kernel pktgen module (no DPDK/hugepages needed)
 #
@@ -63,7 +65,14 @@
 set -uo pipefail
 
 FLOOD_DPORT=9000  # target port on the validator under test
-FLOOD_SPORT=8424  # default source port everything egresses from — override per-box with `floodsd setup-srcport` if this box's egress firewall pins a different port
+FLOOD_SPORT=8424  # base source port everything egresses from — override per-box with `floodsd setup-srcport` if this box's egress firewall pins a different port
+# Rotate the source port across FLOOD_SPORT_CNT consecutive ports
+# (FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1). The receiver's NIC hashes
+# the UDP 5-tuple (incl. src port) to pick an RX queue, so varying the src
+# port spreads the flood across the target's net tiles instead of pinning it
+# to one. All these ports must be egress-allowed by this box's firewall.
+# Set to 1 to disable rotation (single src port = single RX queue/tile).
+FLOOD_SPORT_CNT=10
 
 FLOODSD_STATE_DIR="$HOME/.config/floodsd"
 FLOODSD_STATE_FILE="$FLOODSD_STATE_DIR/state"
@@ -625,6 +634,33 @@ _floodsd_setup() {
         fi
     fi
 
+    # Cycle-check the whole source-port rotation range. The flood rotates the
+    # src port across FLOOD_SPORT..FLOOD_SPORT+FLOOD_SPORT_CNT-1 (to spread the
+    # traffic across the target's RX queues / net tiles), so every one of those
+    # ports must be egress-allowed by this box's firewall — a blocked port in
+    # the range would silently swallow that fraction of the flood. Send one
+    # probe from each port and flag any that can't be bound/sent from.
+    # NOTE: a successful probe only confirms this box could bind + emit from the
+    # port locally; it does not prove the far-side firewall accepts it (there's
+    # no reply). It reliably catches local problems (port in use, local egress
+    # reject, bind failure); confirm true egress with a tcpdump on the target.
+    local spcnt=${FLOOD_SPORT_CNT:-1} p bad=""
+    if [ "$spcnt" -gt 1 ]; then
+        echo "Cycle-checking source ports $FLOOD_SPORT..$((FLOOD_SPORT + spcnt - 1)) (flood rotates across them)..."
+        for ((p = FLOOD_SPORT; p < FLOOD_SPORT + spcnt; p++)); do
+            if _fd_udp_probe "$probeif" "$destip" "$FLOOD_DPORT" "$p" >/dev/null 2>&1; then
+                echo "  port $p: OK"
+            else
+                echo "  port $p: FAILED to send (in use, or blocked by a local egress rule?)"
+                bad="$bad $p"
+            fi
+        done
+        if [ -n "$bad" ]; then
+            echo "floodsd setup: WARNING — could not emit from port(s):$bad — the flood will lose the fraction hashed to those ports."
+            echo "  Ensure every port in $FLOOD_SPORT..$((FLOOD_SPORT + spcnt - 1)) is egress-allowed, or lower FLOOD_SPORT_CNT."
+        fi
+    fi
+
     _floodsd_set if "$iface"
     _floodsd_set destip "$destip"
     _floodsd_set destmac "$destmac"
@@ -877,6 +913,12 @@ _floodsd_kernel() {
     # target) can leave stale devices attached that 'start' would fire too.
     _fd_kernel_cleanup_all
 
+    # Source-port rotation range: FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1.
+    # pktgen picks a random src port in [udp_src_min, udp_src_max) each time it
+    # (re)builds a packet (i.e. every clone_skb copies) when UDPSRC_RND is set,
+    # spreading the flood across the target's RX queues / net tiles.
+    local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + ${FLOOD_SPORT_CNT:-1}))
+
     local i core dev thread cmd
     for ((i = 0; i < ncores; i++)); do
         core=$((hi - i))
@@ -891,10 +933,11 @@ _floodsd_kernel() {
             return 1
         fi
 
-        for cmd in "count 0" "clone_skb 10000" "pkt_size 64" \
+        for cmd in "count 0" "clone_skb 1000" "pkt_size 64" \
                    "queue_map_min $i" "queue_map_max $i" \
                    "dst $destip" "dst_mac $destmac" \
-                   "udp_src_min $FLOOD_SPORT" "udp_src_max $FLOOD_SPORT" \
+                   "flag UDPSRC_RND" \
+                   "udp_src_min $sport_lo" "udp_src_max $sport_hi" \
                    "udp_dst_min $FLOOD_DPORT" "udp_dst_max $FLOOD_DPORT"; do
             if ! _fd_kernel_write "/proc/net/pktgen/$dev" "$cmd"; then
                 case "$cmd" in
@@ -1201,17 +1244,40 @@ _floodsd_dpdk() {
 
     [ "$mellanox" != 1 ] && _fd_vfio_bind floodsd "$iface" "$pci" "$curdrv" "$FLOODSD_VFIO_STATE" "" "$ifip"
 
+    # Source-port rotation: sweep FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1
+    # so the target's NIC hashes the flood across its RX queues / net tiles.
+    # DPDK pktgen only varies fields in "range" mode, and range mode ignores
+    # the plain `set` values — so every field must be given as a range (a
+    # min==max==inc-0 range is a fixed field). sport increments by 1 and wraps
+    # at max, giving an even round-robin across the port range.
+    local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + ${FLOOD_SPORT_CNT:-1} - 1))
     local cmds="$FLOODSD_DPDK_CMDS"
     mkdir -p "$(dirname "$cmds")"
     cat > "$cmds" <<EOF
-set 0 dst mac $destmac
-set 0 dst ip $destip
-set 0 proto udp
-set 0 dport $FLOOD_DPORT
-set 0 sport $FLOOD_SPORT
-set 0 size 64
 disable 0 vlan
-set 0 src ip ${ifip:-0.0.0.0}
+range 0 dst mac start $destmac
+range 0 dst ip start $destip
+range 0 dst ip min $destip
+range 0 dst ip max $destip
+range 0 dst ip inc 0.0.0.0
+range 0 src ip start ${ifip:-0.0.0.0}
+range 0 src ip min ${ifip:-0.0.0.0}
+range 0 src ip max ${ifip:-0.0.0.0}
+range 0 src ip inc 0.0.0.0
+range 0 proto udp
+range 0 dport start $FLOOD_DPORT
+range 0 dport min $FLOOD_DPORT
+range 0 dport max $FLOOD_DPORT
+range 0 dport inc 0
+range 0 sport start $sport_lo
+range 0 sport min $sport_lo
+range 0 sport max $sport_hi
+range 0 sport inc 1
+range 0 size start 64
+range 0 size min 64
+range 0 size max 64
+range 0 size inc 0
+enable 0 range
 EOF
 
     echo "Launching pktgen on $iface ($pci) -> $destip ($destmac), lcores $lcores (main $main)..."
@@ -1257,7 +1323,7 @@ _floodsd_diagnose() {
     sport=$(_floodsd_get sport); sport=${sport:-$FLOOD_SPORT}
 
     echo "== floodsd diagnose =="
-    echo "Source port: $sport (dport $FLOOD_DPORT)"
+    echo "Source port: $sport..$((sport + ${FLOOD_SPORT_CNT:-1} - 1)) (rotated; dport $FLOOD_DPORT)"
     command -v python3 >/dev/null 2>&1 || echo "  WARNING: python3 not found — 'floodsd setup' probes need it."
 
     if [ -z "$iface" ]; then

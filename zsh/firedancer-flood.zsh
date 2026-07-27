@@ -5,7 +5,9 @@
 # run — floodfd is standalone (no _fdbin/_fdconfig dependency):
 #   floodfd dpdk    DPDK pktgen (userspace, needs a NIC bound to vfio-pci/mlx5)
 #   floodfd kernel  in-kernel pktgen module (no DPDK/hugepages needed)
-# Both always send 64B (min-sized) UDP packets at dport 9000, matching pktfd.
+# Both send 64B (min-sized) UDP packets at dport 9000, matching pktfd, rotating
+# the src port across a small range (FLOODFD_SPORT/FLOODFD_SPORT_CNT) so the
+# target hashes the flood across its RX queues / net tiles.
 #
 # `floodfd setup` resolves and saves the target once: pick the sending NIC,
 # enter the destination IP, then floodfd pings it and reads the resolved MAC
@@ -20,6 +22,16 @@
 # physical-loopback rig.
 
 FLOODFD_STATE_FILE="$HOME/.config/dotfiles/floodfd-state"
+
+# Source-port rotation: sweep FLOOD_SPORT .. FLOOD_SPORT+FLOODFD_SPORT_CNT-1 so
+# the target's NIC hashes the flood across its RX queues / net tiles instead of
+# pinning it to one. All these ports must be egress-allowed by this box's
+# firewall. Set FLOODFD_SPORT_CNT=1 to disable rotation (single src port =
+# single RX queue/tile). dport stays fixed (the validator's listen port).
+FLOODFD_SPORT=8424
+FLOODFD_SPORT_CNT=10
+FLOODFD_DPORT=9000
+
 _floodfd_get() { grep "^$1=" "$FLOODFD_STATE_FILE" 2>/dev/null | cut -d= -f2-; }
 _floodfd_set() {
     local key=$1 val=$2
@@ -144,6 +156,9 @@ function _floodfd_kernel() {
     sudo modprobe pktgen
     echo "stop" | sudo tee /proc/net/pktgen/pgctrl >/dev/null 2>&1
 
+    # Source-port rotation range (udp_src_max is exclusive in pktgen).
+    local sport_lo=$FLOODFD_SPORT sport_hi=$((FLOODFD_SPORT + FLOODFD_SPORT_CNT))
+
     local i core dev thread
     for ((i = 0; i < ncores; i++)); do
         core=$((hi - i))
@@ -154,15 +169,21 @@ function _floodfd_kernel() {
         echo "add_device $dev" | sudo tee "/proc/net/pktgen/$thread" >/dev/null
 
         echo "count 0"          | sudo tee "/proc/net/pktgen/$dev" >/dev/null
-        echo "clone_skb 10000"  | sudo tee "/proc/net/pktgen/$dev" >/dev/null
+        echo "clone_skb 1000"   | sudo tee "/proc/net/pktgen/$dev" >/dev/null
         echo "pkt_size 64"      | sudo tee "/proc/net/pktgen/$dev" >/dev/null
         echo "delay $delay_ns"  | sudo tee "/proc/net/pktgen/$dev" >/dev/null
         echo "queue_map_min $i" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
         echo "queue_map_max $i" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
         echo "dst $destip"      | sudo tee "/proc/net/pktgen/$dev" >/dev/null
         echo "dst_mac $destmac" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
-        echo "udp_dst_min 9000" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
-        echo "udp_dst_max 9000" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
+        # Rotate the src port across the range so the target hashes the flood
+        # across its RX queues / net tiles (UDPSRC_RND picks a random port in
+        # [min,max) each time pktgen rebuilds a packet, i.e. every clone_skb).
+        echo "flag UDPSRC_RND"        | sudo tee "/proc/net/pktgen/$dev" >/dev/null
+        echo "udp_src_min $sport_lo"  | sudo tee "/proc/net/pktgen/$dev" >/dev/null
+        echo "udp_src_max $sport_hi"  | sudo tee "/proc/net/pktgen/$dev" >/dev/null
+        echo "udp_dst_min $FLOODFD_DPORT" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
+        echo "udp_dst_max $FLOODFD_DPORT" | sudo tee "/proc/net/pktgen/$dev" >/dev/null
     done
 
     # Writing "start" blocks until "stop" is written, so background it and
@@ -327,15 +348,38 @@ function _floodfd_dpdk() {
 
     [ "$mellanox" != 1 ] && _fd_vfio_bind floodfd "$iface" "$pci" "$curdrv" /tmp/floodfd-bound "" "$ifip"
 
+    # Source-port rotation: sweep the port range so the target hashes the flood
+    # across its RX queues / net tiles. DPDK pktgen only varies fields in
+    # "range" mode, and range mode ignores the plain `set` values — so every
+    # field must be given as a range (min==max==inc-0 = fixed). sport increments
+    # by 1 and wraps at max for an even round-robin across the range.
+    local sport_lo=$FLOODFD_SPORT sport_hi=$((FLOODFD_SPORT + FLOODFD_SPORT_CNT - 1))
     local cmds=/tmp/floodfd-dpdk.pkt
     cat > "$cmds" <<EOF
-set 0 dst mac $destmac
-set 0 dst ip $destip
-set 0 proto udp
-set 0 dport 9000
-set 0 size 64
 disable 0 vlan
-set 0 src ip ${ifip:-0.0.0.0}
+range 0 dst mac start $destmac
+range 0 dst ip start $destip
+range 0 dst ip min $destip
+range 0 dst ip max $destip
+range 0 dst ip inc 0.0.0.0
+range 0 src ip start ${ifip:-0.0.0.0}
+range 0 src ip min ${ifip:-0.0.0.0}
+range 0 src ip max ${ifip:-0.0.0.0}
+range 0 src ip inc 0.0.0.0
+range 0 proto udp
+range 0 dport start $FLOODFD_DPORT
+range 0 dport min $FLOODFD_DPORT
+range 0 dport max $FLOODFD_DPORT
+range 0 dport inc 0
+range 0 sport start $sport_lo
+range 0 sport min $sport_lo
+range 0 sport max $sport_hi
+range 0 sport inc 1
+range 0 size start 64
+range 0 size min 64
+range 0 size max 64
+range 0 size inc 0
+enable 0 range
 EOF
 
     echo "Launching pktgen on $iface ($pci) -> $destip ($destmac), lcores $lcores (main $main)..."
