@@ -98,7 +98,7 @@ _fd_bond_tag() {
         echo "[bond${mode:+, mode $mode}${slaves:+, slaves: $slaves}]"
         return
     fi
-    master=$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)
+    master=$(readlink "/sys/class/net/$iface/master" 2>/dev/null)
     [ -n "$master" ] && echo "[bonded slave of ${master##*/}]"
 }
 
@@ -324,7 +324,7 @@ _fd_vfio_restore() {
 # `floodsd restore` can re-add it afterward.
 _fd_bond_detach() {
     local iface=$1 master
-    master=$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)
+    master=$(readlink "/sys/class/net/$iface/master" 2>/dev/null)
     [ -z "$master" ] && return 0
     master=${master##*/}
 
@@ -342,7 +342,7 @@ _fd_bond_detach() {
     echo "-$iface" | sudo tee "/sys/class/net/$master/bonding/slaves" >/dev/null
     # Verify the release actually took rather than assuming the sysfs write
     # worked — same reasoning as _fd_kernel_cleanup_all's post-write check.
-    if [ -n "$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)" ]; then
+    if [ -n "$(readlink "/sys/class/net/$iface/master" 2>/dev/null)" ]; then
         echo "  WARNING: '$iface' still shows as enslaved to '$master' after asking the bond to release it — DPDK may still conflict with it."
     fi
     mkdir -p "$(dirname "$FLOODSD_BOND_STATE")"
@@ -377,7 +377,7 @@ _fd_bond_reattach() {
     # Verify the sysfs write actually took rather than assuming it worked —
     # same reasoning as _fd_kernel_cleanup_all's post-write check.
     local nowmaster
-    nowmaster=$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)
+    nowmaster=$(readlink "/sys/class/net/$iface/master" 2>/dev/null)
     rm -f "$FLOODSD_BOND_STATE"
     if [ -z "$nowmaster" ]; then
         echo "floodsd restore: WARNING — '$iface' doesn't show as enslaved to any bond after re-adding it to '$bond'."
@@ -549,7 +549,7 @@ _floodsd_setup() {
     # when a slave is picked; $iface (the slave) is still what actually
     # floods later, once resolved.
     local probeif="$iface" bondmaster
-    bondmaster=$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)
+    bondmaster=$(readlink "/sys/class/net/$iface/master" 2>/dev/null)
     if [ -n "$bondmaster" ]; then
         probeif=${bondmaster##*/}
         echo "'$iface' is a bonded slave — its inbound traffic (so ARP/probe replies too) lands on '$probeif', not '$iface'."
