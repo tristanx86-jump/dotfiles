@@ -29,7 +29,7 @@ FLOODFD_STATE_FILE="$HOME/.config/dotfiles/floodfd-state"
 # firewall. Set FLOODFD_SPORT_CNT=1 to disable rotation (single src port =
 # single RX queue/tile). dport stays fixed (the validator's listen port).
 FLOODFD_SPORT=8424
-FLOODFD_SPORT_CNT=10
+FLOODFD_SPORT_CNT=30
 FLOODFD_DPORT=9000
 
 _floodfd_get() { grep "^$1=" "$FLOODFD_STATE_FILE" 2>/dev/null | cut -d= -f2-; }

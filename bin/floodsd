@@ -72,7 +72,7 @@ FLOOD_SPORT=8424  # base source port everything egresses from — override per-b
 # port spreads the flood across the target's net tiles instead of pinning it
 # to one. All these ports must be egress-allowed by this box's firewall.
 # Set to 1 to disable rotation (single src port = single RX queue/tile).
-FLOOD_SPORT_CNT=10
+FLOOD_SPORT_CNT=30
 
 FLOODSD_STATE_DIR="$HOME/.config/floodsd"
 FLOODSD_STATE_FILE="$FLOODSD_STATE_DIR/state"
@@ -404,6 +404,11 @@ _fd_bond_reattach() {
 # hardware TX ring for a flood engine to drive directly, so this prompts for
 # one of its slaves to actually flood from instead, printing the choice to
 # stdout. Enter keeps [current] if given.
+# _fd_bond_pick_slave <bond> [current]: prompt for which slave(s) of <bond> to
+# flood from. Prints the chosen slave name, OR the literal token "ALL" if the
+# user picks the all-slaves option (spread TX across every slave for max
+# throughput — each slave is a separate physical NIC with its own TX rings, so
+# driving both ~doubles the achievable pps against a multi-slave-bond target).
 _fd_bond_pick_slave() {
     local bond=$1 cur=$2
     local slaves; slaves=$(cat "/sys/class/net/$bond/bonding/slaves" 2>/dev/null)
@@ -412,16 +417,26 @@ _fd_bond_pick_slave() {
         return 1
     fi
     local arr=($slaves) idx=1 s
+    # Single slave: nothing to choose, and "all" would be identical — just use it.
+    if [ "${#arr[@]}" -eq 1 ]; then
+        echo "${arr[0]}"
+        return 0
+    fi
     echo "'$bond' is a bond — pick which of its slaves to actually flood from:" >&2
     for s in "${arr[@]}"; do
         printf "  %d) %s\n" "$idx" "$s" >&2
         idx=$((idx + 1))
     done
+    printf "  a) ALL slaves (max throughput — spread TX cores across every slave)\n" >&2
     local sel
-    read -rp "Slave${cur:+ (Enter = keep '$cur')} [1-${#arr[@]}]: " sel
+    read -rp "Slave${cur:+ (Enter = keep '$cur')} [1-${#arr[@]}/a]: " sel
     if [ -z "$sel" ]; then
         [ -z "$cur" ] && { echo "floodsd: no slave selected." >&2; return 1; }
         echo "$cur"
+        return 0
+    fi
+    if [ "$sel" = a ] || [ "$sel" = A ] || [ "$sel" = all ]; then
+        echo "ALL"
         return 0
     fi
     if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#arr[@]}" ]; then
@@ -743,16 +758,18 @@ _fd_kernel_norm_rate() {
     esac
 }
 
-# _fd_kernel_set_delay <iface> <ncores> <rate>: computes the per-thread
+# _fd_kernel_set_delay <rate> <ncores> <dev>...: computes the per-thread
 # nanosecond delay for <rate> Mpps split evenly across <ncores> threads
-# (MAX = 0 delay, i.e. no throttling) and writes it to each configured
-# device. Safe to call on a running flood or a stopped one — pktgen doesn't
-# document live reconfiguration of an active device, so callers that want a
-# rate change to apply mid-flood are expected to stop/restart around this
-# (see the 'start <rate>' command in _floodsd_kernel).
+# (MAX = 0 delay, i.e. no throttling) and writes it to each given device.
+# Devices are passed explicitly (as "iface@N" names) so this works whether the
+# flood runs on one interface or several bond slaves at once. Safe to call on a
+# running flood or a stopped one — pktgen doesn't document live reconfiguration
+# of an active device, so callers that want a rate change to apply mid-flood
+# are expected to stop/restart around this (see 'start <rate>' in _floodsd_kernel).
 _fd_kernel_set_delay() {
-    local iface=$1 ncores=$2 rate=$3
-    local delay_ns i
+    local rate=$1 ncores=$2; shift 2
+    local devs=("$@")
+    local delay_ns dev
     if [ "$rate" = MAX ]; then
         delay_ns=0
     else
@@ -762,20 +779,21 @@ _fd_kernel_set_delay() {
             printf "%d", 1000000000 / pps_per_core
         }')
     fi
-    for ((i = 0; i < ncores; i++)); do
-        echo "delay $delay_ns" | sudo tee "/proc/net/pktgen/${iface}@${i}" >/dev/null
+    for dev in "${devs[@]}"; do
+        echo "delay $delay_ns" | sudo tee "/proc/net/pktgen/${dev}" >/dev/null
     done
 }
 
-# _fd_kernel_pkt_total <iface> <ncores>: sums "pkts-sofar" across all
-# configured devices — used to compute the live Mpps counter.
+# _fd_kernel_pkt_total <dev>...: sums "pkts-sofar" across all given devices
+# (each an "iface@N" name) — used to compute the live Mpps counter. Works
+# across multiple bond slaves since the device list is passed explicitly.
 _fd_kernel_pkt_total() {
-    local iface=$1 ncores=$2 i val total=0
-    for ((i = 0; i < ncores; i++)); do
+    local dev val total=0
+    for dev in "$@"; do
         # sudo'd: pktgen's proc entries are commonly root-read-only (0600), so
         # an unprivileged read here just silently fails (2>/dev/null hides
         # it), permanently pinning the Mpps counter at 0 on boxes like that.
-        val=$(sudo grep "pkts-sofar" "/proc/net/pktgen/${iface}@${i}" 2>/dev/null | awk '{print $2}')
+        val=$(sudo grep "pkts-sofar" "/proc/net/pktgen/${dev}" 2>/dev/null | awk '{print $2}')
         total=$((total + val))
     done
     echo "$total"
@@ -876,17 +894,28 @@ _floodsd_kernel() {
         return 1
     fi
 
+    # ifaces[] is the list of physical interfaces pktgen will actually drive.
+    # For a plain NIC that's just itself; for a bond it's one chosen slave, or
+    # every slave when the user picks "all" (each slave is a separate physical
+    # NIC with its own TX rings, so driving them all ~multiplies throughput).
+    local ifaces=("$iface")
     if [ -d "/sys/class/net/$iface/bonding" ]; then
         # pktgen injects packets directly into a real per-queue hardware TX
         # ring; a bond is a purely software netdevice with no such thing, and
         # driving it directly tends to surface as skb/protocol errors rather
-        # than a clean failure — so flood from one of its slaves instead.
+        # than a clean failure — so flood from its slave(s) instead.
         local bondiface="$iface" slave
         slave=$(_fd_bond_pick_slave "$bondiface" "$(_floodsd_get kernslave)") || return 1
         _floodsd_set kernslave "$slave"
-        echo "Flooding via '$slave' — '$bondiface' itself has no real hardware TX ring for pktgen to drive."
-        iface="$slave"
+        if [ "$slave" = ALL ]; then
+            ifaces=($(cat "/sys/class/net/$bondiface/bonding/slaves" 2>/dev/null))
+            echo "Flooding via ALL slaves of '$bondiface': ${ifaces[*]} — '$bondiface' itself has no real hardware TX ring for pktgen to drive."
+        else
+            ifaces=("$slave")
+            echo "Flooding via '$slave' — '$bondiface' itself has no real hardware TX ring for pktgen to drive."
+        fi
     fi
+    local niface=${#ifaces[@]}
 
     local curcores ncores
     curcores=$(_floodsd_get kerncores); curcores=${curcores:-4}
@@ -919,11 +948,28 @@ _floodsd_kernel() {
     # spreading the flood across the target's RX queues / net tiles.
     local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + ${FLOOD_SPORT_CNT:-1}))
 
-    local i core dev thread cmd
+    # Assign each TX core to a device. With multiple interfaces (all-slaves),
+    # cores are dealt out round-robin across them, and each interface's queue
+    # index counts up independently (so iface A gets its queues 0,1,2.. and
+    # iface B its queues 0,1,2.., rather than a shared 0..ncores that could run
+    # off the end of one NIC's queue count). devs[] records every device name
+    # so the rate/delay/cleanup helpers can act on all of them.
+    local i core dev thread cmd ifidx qidx
+    local -a devs=()
+    local -a ifq   # per-interface queue counter
+    for ((i = 0; i < niface; i++)); do ifq[$i]=0; done
     for ((i = 0; i < ncores; i++)); do
         core=$((hi - i))
         thread="kpktgend_${core}"
-        dev="${iface}@${i}"
+        ifidx=$((i % niface))
+        iface="${ifaces[$ifidx]}"
+        qidx=${ifq[$ifidx]}
+        ifq[$ifidx]=$((qidx + 1))
+        # Device name suffix is the per-interface queue index (matches
+        # queue_map below). Unique per interface, and each slave's queues start
+        # at 0 so we never index past a NIC's real TX-queue count.
+        dev="${iface}@${qidx}"
+        devs+=("$dev")
 
         if ! _fd_kernel_write "/proc/net/pktgen/$thread" "add_device $dev"; then
             echo "  If this is 'Permission denied' despite running as root, it's very likely SELinux (common on hardened RHEL-family boxes):"
@@ -934,7 +980,7 @@ _floodsd_kernel() {
         fi
 
         for cmd in "count 0" "clone_skb 1000" "pkt_size 64" \
-                   "queue_map_min $i" "queue_map_max $i" \
+                   "queue_map_min $qidx" "queue_map_max $qidx" \
                    "dst $destip" "dst_mac $destmac" \
                    "flag UDPSRC_RND" \
                    "udp_src_min $sport_lo" "udp_src_max $sport_hi" \
@@ -951,9 +997,13 @@ _floodsd_kernel() {
             fi
         done
     done
-    _fd_kernel_set_delay "$iface" "$ncores" "$rate"
+    _fd_kernel_set_delay "$rate" "$ncores" "${devs[@]}"
 
-    echo "Configured $ncores TX cores (cores $lo-$hi) -> $destip ($destmac) via $iface."
+    if [ "$niface" -gt 1 ]; then
+        echo "Configured $ncores TX cores (cores $lo-$hi) across ${niface} slaves (${ifaces[*]}) -> $destip ($destmac)."
+    else
+        echo "Configured $ncores TX cores (cores $lo-$hi) -> $destip ($destmac) via ${ifaces[0]}."
+    fi
     echo "Commands: start | start <mpps|max> | stop | rate | quit"
 
     local running=0 p1=0 p2 diff mpps line rc last_t=0 now prompt_shown=0
@@ -995,7 +1045,7 @@ _floodsd_kernel() {
                         # stops the terminal's raw signal from also hitting it first.
                         ( trap '' INT; echo "start" | sudo tee /proc/net/pktgen/pgctrl >/dev/null ) &
                         running=1
-                        p1=$(_fd_kernel_pkt_total "$iface" "$ncores")
+                        p1=$(_fd_kernel_pkt_total "${devs[@]}")
                         last_t=$(date +%s.%N)
                         echo "Started at ${rate} Mpps."
                     fi
@@ -1010,11 +1060,11 @@ _floodsd_kernel() {
                         if [ "$running" = 1 ]; then
                             echo "stop" | sudo tee /proc/net/pktgen/pgctrl >/dev/null 2>&1
                         fi
-                        _fd_kernel_set_delay "$iface" "$ncores" "$rate"
+                        _fd_kernel_set_delay "$rate" "$ncores" "${devs[@]}"
                         # Backgrounded + INT-ignoring for the same reason as the 'start' case above.
                         ( trap '' INT; echo "start" | sudo tee /proc/net/pktgen/pgctrl >/dev/null ) &
                         running=1
-                        p1=$(_fd_kernel_pkt_total "$iface" "$ncores")
+                        p1=$(_fd_kernel_pkt_total "${devs[@]}")
                         last_t=$(date +%s.%N)
                         echo "Rate set to ${rate} Mpps."
                     fi
@@ -1030,7 +1080,7 @@ _floodsd_kernel() {
                     ;;
                 rate)
                     if [ "$running" = 1 ]; then
-                        p2=$(_fd_kernel_pkt_total "$iface" "$ncores")
+                        p2=$(_fd_kernel_pkt_total "${devs[@]}")
                         now=$(date +%s.%N)
                         diff=$((p2 - p1))
                         mpps=$(awk -v diff="$diff" -v t0="$last_t" -v t1="$now" 'BEGIN {
@@ -1057,7 +1107,7 @@ _floodsd_kernel() {
             rc=$?
             if [ "$rc" -gt 128 ]; then
                 if [ "$running" = 1 ]; then
-                    p2=$(_fd_kernel_pkt_total "$iface" "$ncores")
+                    p2=$(_fd_kernel_pkt_total "${devs[@]}")
                     now=$(date +%s.%N)
                     diff=$((p2 - p1))
                     mpps=$(awk -v diff="$diff" -v t0="$last_t" -v t1="$now" 'BEGIN {
