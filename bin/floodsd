@@ -72,7 +72,7 @@ FLOOD_SPORT=8424  # base source port everything egresses from — override per-b
 # port spreads the flood across the target's net tiles instead of pinning it
 # to one. All these ports must be egress-allowed by this box's firewall.
 # Set to 1 to disable rotation (single src port = single RX queue/tile).
-FLOOD_SPORT_CNT=30
+FLOOD_SPORT_CNT=100
 
 FLOODSD_STATE_DIR="$HOME/.config/floodsd"
 FLOODSD_STATE_FILE="$FLOODSD_STATE_DIR/state"
