@@ -16,4 +16,4 @@ at dport 9000. Two engines, chosen explicitly each run:
 | `floodfd stop` | Stop the in-kernel pktgen flood (`floodfd kernel`'s Ctrl-C only stops watching, not the traffic). |
 | `floodfd restore` | Undo `floodfd dpdk`'s vfio-pci bind — return the NIC to its kernel driver. |
 
-Standalones: `floodsd`
+Standalones: `floodsd` (install: `install-floodsd.sh`; refresh with `updateflood` -- updates floodsd only, installs nothing new)
