@@ -10,11 +10,14 @@
 # `floodsd dpdk`) apt/dnf/yum.
 #
 # Load-tests a remote firedancer validator from a *separate* box: always
-# sends 64B (min-sized) UDP packets to dport 9000, sourced from a small range
-# of ports starting at 8424 (see FLOOD_SPORT/FLOOD_SPORT_CNT below) — rotating
-# the src port so the target's NIC hashes the flood across its RX queues / net
-# tiles. All these ports must be egress-allowed by this box's firewall. Two
-# engines, chosen explicitly each run:
+# sends 64B (min-sized) UDP packets to dport 9000. By default it uses a
+# single source port (8424; see FLOOD_SPORT below), pinning the flood to one
+# of the target's RX queues / net tiles. Pass --multiport to `floodsd setup`
+# / `floodsd kernel` to instead rotate the src port across a small range
+# (FLOOD_SPORT..FLOOD_SPORT+FLOOD_SPORT_CNT-1) so the target's NIC hashes the
+# flood across all its RX queues / net tiles. Every source port used must be
+# egress-allowed by this box's firewall. Two engines, chosen explicitly each
+# run:
 #   floodsd dpdk    DPDK pktgen (userspace, needs a NIC bound to vfio-pci/mlx5)
 #   floodsd kernel  in-kernel pktgen module (no DPDK/hugepages needed)
 #
@@ -66,13 +69,31 @@ set -uo pipefail
 
 FLOOD_DPORT=9000  # target port on the validator under test
 FLOOD_SPORT=8424  # base source port everything egresses from — override per-box with `floodsd setup-srcport` if this box's egress firewall pins a different port
-# Rotate the source port across FLOOD_SPORT_CNT consecutive ports
-# (FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1). The receiver's NIC hashes
-# the UDP 5-tuple (incl. src port) to pick an RX queue, so varying the src
-# port spreads the flood across the target's net tiles instead of pinning it
-# to one. All these ports must be egress-allowed by this box's firewall.
-# Set to 1 to disable rotation (single src port = single RX queue/tile).
+# Source-port rotation is OPT-IN (default: a single source port). Pass
+# --multiport to `floodsd setup` / `floodsd kernel` to rotate the src port
+# across FLOOD_SPORT_CNT consecutive ports (FLOOD_SPORT ..
+# FLOOD_SPORT+FLOOD_SPORT_CNT-1). The receiver's NIC hashes the UDP 5-tuple
+# (incl. src port) to pick an RX queue, so varying the src port spreads the
+# flood across the target's net tiles instead of pinning it to one; a single
+# port pins the whole flood to one RX queue / net tile. Every port used must
+# be egress-allowed by this box's firewall. FLOOD_SPORT_CNT only takes effect
+# in --multiport mode; the default is always one port.
 FLOOD_SPORT_CNT=100
+
+# Runtime toggle for the source-port rotation above. Off by default (single
+# port); `--multiport` on `floodsd setup`/`floodsd kernel` flips it on for
+# that invocation. _fd_sport_cnt is the effective port count everything else
+# reads: the full FLOOD_SPORT_CNT range when multiport is on, otherwise 1.
+FLOOD_MULTIPORT=0
+_fd_parse_multiport() {
+    local a
+    for a in "$@"; do
+        [ "$a" = "--multiport" ] && FLOOD_MULTIPORT=1
+    done
+}
+_fd_sport_cnt() {
+    if [ "$FLOOD_MULTIPORT" = 1 ]; then echo "${FLOOD_SPORT_CNT:-1}"; else echo 1; fi
+}
 
 FLOODSD_STATE_DIR="$HOME/.config/floodsd"
 FLOODSD_STATE_FILE="$FLOODSD_STATE_DIR/state"
@@ -558,6 +579,7 @@ _fd_diagnose_probe() {
 # reachability check — if no ARP entry ever resolves, something's wrong with
 # routing/cabling before you ever get to flooding.
 _floodsd_setup() {
+    _fd_parse_multiport "$@"
     local iface
     iface=$(_fd_pick_iface "floodsd" "Sending NIC" "$(_floodsd_get if)") || return 1
 
@@ -659,7 +681,8 @@ _floodsd_setup() {
     # port locally; it does not prove the far-side firewall accepts it (there's
     # no reply). It reliably catches local problems (port in use, local egress
     # reject, bind failure); confirm true egress with a tcpdump on the target.
-    local spcnt=${FLOOD_SPORT_CNT:-1} p bad=""
+    local spcnt; spcnt=$(_fd_sport_cnt)
+    local p bad=""
     if [ "$spcnt" -gt 1 ]; then
         echo "Cycle-checking source ports $FLOOD_SPORT..$((FLOOD_SPORT + spcnt - 1)) (flood rotates across them)..."
         for ((p = FLOOD_SPORT; p < FLOOD_SPORT + spcnt; p++)); do
@@ -883,6 +906,7 @@ _fd_kernel_write() {
 # 'floodsd restore' equivalent for the kernel engine — quit's own cleanup
 # is what's supposed to guarantee nothing is left running/attached.
 _floodsd_kernel() {
+    _fd_parse_multiport "$@"
     local iface destip destmac
     iface=$(_floodsd_get if); destip=$(_floodsd_get destip); destmac=$(_floodsd_get destmac)
     if [ -z "$iface" ] || [ -z "$destip" ] || [ -z "$destmac" ]; then
@@ -942,11 +966,19 @@ _floodsd_kernel() {
     # target) can leave stale devices attached that 'start' would fire too.
     _fd_kernel_cleanup_all
 
-    # Source-port rotation range: FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1.
-    # pktgen picks a random src port in [udp_src_min, udp_src_max) each time it
-    # (re)builds a packet (i.e. every clone_skb copies) when UDPSRC_RND is set,
-    # spreading the flood across the target's RX queues / net tiles.
-    local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + ${FLOOD_SPORT_CNT:-1}))
+    # Source-port range: [sport_lo, sport_hi). In --multiport mode this spans
+    # FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1; by default it's the single
+    # port FLOOD_SPORT (hi = lo+1). pktgen picks a random src port in
+    # [udp_src_min, udp_src_max) each time it (re)builds a packet (every
+    # clone_skb copy) when UDPSRC_RND is set — with a 1-wide range that's just
+    # the one port, pinning the flood to a single RX queue / net tile.
+    local spcnt; spcnt=$(_fd_sport_cnt)
+    local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + spcnt))
+    if [ "$FLOOD_MULTIPORT" = 1 ]; then
+        echo "Source-port rotation: ON (--multiport) — sweeping $sport_lo..$((sport_hi - 1)) across the target's RX queues / net tiles."
+    else
+        echo "Source-port rotation: OFF (default) — single source port $sport_lo (one RX queue / net tile). Pass --multiport to spread across queues."
+    fi
 
     # Assign each TX core to a device. With multiple interfaces (all-slaves),
     # cores are dealt out round-robin across them, and each interface's queue
@@ -1368,12 +1400,18 @@ _floodsd_restore() {
 # rules for the configured source port. Entirely opt-in — nothing else in
 # floodsd calls this, so it never adds noise unless you run it yourself.
 _floodsd_diagnose() {
-    local iface destip destmac sport
+    _fd_parse_multiport "$@"
+    local iface destip destmac sport spcnt
     iface=$(_floodsd_get if); destip=$(_floodsd_get destip); destmac=$(_floodsd_get destmac)
     sport=$(_floodsd_get sport); sport=${sport:-$FLOOD_SPORT}
+    spcnt=$(_fd_sport_cnt)
 
     echo "== floodsd diagnose =="
-    echo "Source port: $sport..$((sport + ${FLOOD_SPORT_CNT:-1} - 1)) (rotated; dport $FLOOD_DPORT)"
+    if [ "$spcnt" -gt 1 ]; then
+        echo "Source port: $sport..$((sport + spcnt - 1)) (rotated, --multiport; dport $FLOOD_DPORT)"
+    else
+        echo "Source port: $sport (single; dport $FLOOD_DPORT — pass --multiport to see the rotation range)"
+    fi
     command -v python3 >/dev/null 2>&1 || echo "  WARNING: python3 not found — 'floodsd setup' probes need it."
 
     if [ -z "$iface" ]; then
@@ -1430,7 +1468,7 @@ floodsd() {
         stop)          shift; _floodsd_stop "$@";          return ;;
         restore)       shift; _floodsd_restore "$@";       return ;;
         *)
-            echo "Usage: floodsd setup | setup-srcport | diagnose | dpdk | kernel | stop | restore"
+            echo "Usage: floodsd setup [--multiport] | setup-srcport | diagnose [--multiport] | dpdk | kernel [--multiport] | stop | restore"
             return 1
             ;;
     esac
