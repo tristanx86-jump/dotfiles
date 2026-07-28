@@ -10,6 +10,8 @@
 
       "Allow clipboard access": true,
 
+      "Minimum Contrast": 0.2,
+
       "Background Color": {
         "Red Component": 0.1020, "Green Component": 0.1059, "Blue Component": 0.1490, "Alpha Component": 1
       },
