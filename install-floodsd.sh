@@ -70,7 +70,44 @@ UPDATEFLOOD
 sed -i "s|__DOTFILES_DIR__|$DOTFILES_DIR|" "$dest_dir/updateflood"
 chmod +x "$dest_dir/updateflood"
 echo "[floodsd] updateflood installed to $dest_dir/updateflood (refreshes floodsd only)."
+# Make floodsd/updateflood usable by name. If ~/.local/bin is already on PATH
+# (common on many distros), nothing to do. Otherwise offer -- opt-in only, never
+# silently -- to add it to the shell rc, preserving this installer's "safe on
+# someone else's box, no surprise rc edits" promise. Declining prints the
+# run-directly hint. A non-interactive run (no TTY) never edits anything.
 case ":$PATH:" in
-    *":$dest_dir:"*) echo "[floodsd] $dest_dir is on your PATH — run: floodsd setup" ;;
-    *) echo "[floodsd] $dest_dir isn't on your PATH — run it directly: $dest_dir/floodsd setup" ;;
+    *":$dest_dir:"*)
+        echo "[floodsd] $dest_dir is on your PATH -- run: floodsd setup"
+        ;;
+    *)
+        # Pick the rc for the current login shell.
+        case "$(basename "${SHELL:-}")" in
+            zsh)  rc="$HOME/.zshrc" ;;
+            bash) rc="$HOME/.bashrc" ;;
+            *)    rc="$HOME/.profile" ;;
+        esac
+        add_path=""
+        if [ -t 0 ]; then
+            printf "[floodsd] %s isn't on your PATH. Add it to %s? [y/N] " "$dest_dir" "$rc"
+            read -r reply
+            case "$reply" in [yY]|[yY][eE][sS]) add_path=1 ;; esac
+        fi
+        if [ -n "$add_path" ]; then
+            # Idempotent: only append if we haven't already added this line.
+            marker="# added by install-floodsd.sh: put ~/.local/bin on PATH"
+            if ! grep -qsF "$marker" "$rc"; then
+                {
+                    echo ""
+                    echo "$marker"
+                    echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+                } >> "$rc"
+                echo "[floodsd] Added ~/.local/bin to PATH in $rc."
+            else
+                echo "[floodsd] $rc already has the PATH line."
+            fi
+            echo "[floodsd] Open a new shell (or: source $rc), then run: floodsd setup"
+        else
+            echo "[floodsd] $dest_dir isn't on your PATH -- run it directly: $dest_dir/floodsd setup"
+        fi
+        ;;
 esac
