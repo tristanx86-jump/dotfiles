@@ -54,7 +54,11 @@ vim.opt.clipboard = "unnamedplus"
 -- ── Auto-Commands ────────────────────────────────────────
 vim.api.nvim_create_autocmd("BufWritePre", {
   pattern = "*",
-  command = [[%s/\s\+$//e]],
+  callback = function()
+    local view = vim.fn.winsaveview()
+    vim.cmd([[keeppatterns %s/\s\+$//e]])
+    vim.fn.winrestview(view)
+  end,
   desc = "Automatically remove trailing whitespace on save",
 })
 
@@ -140,9 +144,9 @@ require("lazy").setup({
       local ts = require("nvim-treesitter")
       -- Guard: skip when the plugin hasn't been synced to the `main` branch yet
       -- (master has no .install), so startup never hard-errors. Run :Lazy restore.
-      if ts.install then ts.install({ "c", "cpp", "lua", "rust", "python", "bash" }) end
+      if ts.install then ts.install({ "c", "cpp", "lua", "rust", "python", "bash", "markdown", "markdown_inline" }) end
       vim.api.nvim_create_autocmd("FileType", {
-        pattern = { "c", "cpp", "lua", "rust", "python", "sh" },
+        pattern = { "c", "cpp", "lua", "rust", "python", "sh", "markdown" },
         callback = function() pcall(vim.treesitter.start) end,
         desc = "Enable treesitter highlighting",
       })
