@@ -1,6 +1,6 @@
 -- ── Bootstrap Lazy.nvim ──────────────────────────────────
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
-if not vim.loop.fs_stat(lazypath) then
+if not (vim.uv or vim.loop).fs_stat(lazypath) then
   vim.fn.system({
     "git", "clone", "--filter=blob:none",
     "https://github.com/folke/lazy.nvim.git",
@@ -11,8 +11,10 @@ vim.opt.rtp:prepend(lazypath)
 
 -- ── General Configuration ────────────────────────────────
 -- Leader = F1 (avoids any Shift / case issues from held letter keys)
-vim.g.mapleader = "<F1>"
-vim.g.maplocalleader = "<F1>"
+-- vim.g.mapleader takes a literal key sequence, not "<F1>" notation, so the
+-- keycode must be resolved (else every <leader> map is silently dead).
+vim.g.mapleader = vim.keycode("<F1>")
+vim.g.maplocalleader = vim.keycode("<F1>")
 
 -- UI & Layout
 vim.opt.number = true
@@ -92,7 +94,8 @@ require("lazy").setup({
           floats = "dark",
         },
         on_highlights = function(hl, c)
-          hl.Normal = { fg = c.fg_dark, bg = c.bg_dark }
+          -- (Normal left to the theme: transparent=true above lets the terminal bg
+          --  show through; overriding it here re-opaqued the editor and dimmed fg.)
           hl.Comment = { fg = c.dark3 }
           hl.String = { fg = c.green1 }
         end,

@@ -88,7 +88,7 @@ unalias makefd updatefd pktfd devfd testnetfd flamefd metricsfd memfd initfd fin
 # Every function below takes an optional `cmd` first argument (see
 # _fd_dispatch): plain `devfd` runs the validator, `devfd cmd` just shows +
 # copies the command it would have run.
-function makefd()    { make -j $(_fdtarget); }
+function makefd()    { make -j"${MAKE_JOBS:-8}" $(_fdtarget); }
 function devfd() {
     if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$(_fdbinpath)" dev --config "$(_fdconfig)" "$@"; return; fi
     _fd_dispatch "$1" sudo "$(_fdbinpath)" dev --config "$(_fdconfig)"
@@ -122,6 +122,18 @@ function updatefd() {
 
     local cur
     cur=$(git branch --show-current)
+
+    # Safety: never force-push to the real upstream. If origin points at
+    # firedancer-io (the canonical repo), refuse - a force-push there is
+    # outward-facing and forbidden.
+    local originurl
+    originurl=$(git remote get-url origin 2>/dev/null)
+    if printf '%s' "$originurl" | grep -qi 'firedancer-io'; then
+        echo "updatefd: origin is the upstream firedancer-io repo ($originurl)."
+        echo "  Refusing to force-push to upstream. Point origin at your fork first."
+        return 1
+    fi
+
     git fetch upstream || return 1
     git checkout main || return 1
     git reset --hard upstream/main || return 1

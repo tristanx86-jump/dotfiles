@@ -14,6 +14,13 @@ else
     export VISUAL="vi"
 fi
 
+# GCC/Clang diagnostics color fix.
+# This terminal renders any BOLD attribute (SGR 01) as near-black (color0),
+# so GCC defaults (locus/quotes = bare bold, error = bold red) come out
+# dark-on-dark. Redefine every field WITHOUT bold so paths/tokens stay legible
+# regardless of terminal or tmux.
+export GCC_COLORS="error=31:warning=35:note=36:range1=32:range2=34:locus=36:quote=33:fixit-insert=32:fixit-delete=31:diff-filename=36:diff-hunk=32:diff-delete=31:diff-insert=32:type-diagnostics=32"
+
 OS="$(uname -s)"
 # Resolve this file's real directory (it's symlinked into $HOME) so sibling
 # zsh files (hosts, firedancer*) can be sourced regardless of OS.
@@ -178,7 +185,22 @@ function flooddot() { _renderdot flood_cmds.md; }    # floodfd load-gen cmds
 
 # updatedot: pull the latest dotfiles, re-run install.sh, reload the shell.
 function updatedot() {
-    git clone "$DOTFILES_REPO_URL" ~/dotfiles 2>/dev/null || (cd ~/dotfiles && git fetch && git reset --hard origin/main) && chmod +x ~/dotfiles/install.sh && ~/dotfiles/install.sh && exec zsh
+    if [ ! -d ~/dotfiles/.git ]; then
+        git clone "$DOTFILES_REPO_URL" ~/dotfiles || return 1
+    else
+        # Refuse to clobber local work: fast-forward pull only, never a hard
+        # reset. If the tree is dirty or diverged, stop and let the user decide
+        # instead of silently discarding their edits.
+        if [ -n "$(git -C ~/dotfiles status --porcelain)" ]; then
+            echo "updatedot: ~/dotfiles has uncommitted changes - commit or stash first."
+            return 1
+        fi
+        git -C ~/dotfiles pull --ff-only || {
+            echo "updatedot: cannot fast-forward (branch diverged) - resolve manually."
+            return 1
+        }
+    fi
+    chmod +x ~/dotfiles/install.sh && ~/dotfiles/install.sh && exec zsh
 }
 
 # wipedot: undo install.sh — meant for fresh machines/servers. Full revert

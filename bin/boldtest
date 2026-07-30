@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# boldtest — print bold/color SGR combos to eyeball terminal legibility.
+# Used to verify the "bold renders near-black" iTerm2 issue is fixed.
+# If any line below is unreadable (dark-on-dark), bold contrast is still broken.
+esc=$(printf "\033")
+line() { printf "%b%s%b\n" "$1" "$2" "${esc}[0m"; }
+echo "If every line below is clearly readable, bold contrast is FIXED:"
+echo
+line "${esc}[1m"    "  [1m]      bold, default fg   (the GCC file-path / locus case)"
+line "${esc}[1;31m" "  [1;31m]   bold red          (the GCC error: case)"
+line "${esc}[1;32m" "  [1;32m]   bold green"
+line "${esc}[1;34m" "  [1;34m]   bold blue"
+line "${esc}[1;30m" "  [1;30m]   bold black        (worst case: ANSI 0)"
+line "${esc}[2m"    "  [2m]      dim, default fg"
+line "${esc}[0;31m" "  [0;31m]   normal red        (control: should already work)"
+echo
+echo "Compare bold-red above to this normal red — both must be legible."

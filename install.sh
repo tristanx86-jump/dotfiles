@@ -177,7 +177,10 @@ if [[ "$OS" == "Darwin" ]]; then
     if ! command -v brew &>/dev/null; then
         echo "[MacOS] Installing Homebrew..."
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        eval "$(/opt/homebrew/bin/brew shellenv)"
+        # Homebrew lives at /opt/homebrew on Apple Silicon, /usr/local on Intel.
+        for _brewbin in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            [ -x "$_brewbin" ] && eval "$("$_brewbin" shellenv)" && break
+        done
     fi
 
     echo "[MacOS] Installing Core Utilities & Dev Tools..."
@@ -298,16 +301,22 @@ elif [[ "$OS" == "Linux" ]]; then
     _task_kitty() {
         command -v kitty &>/dev/null && return 0
         echo "[Linux] Installing Kitty Terminal..."
-        curl -L https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin
+        curl -fsSL https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin
         mkdir -p ~/.local/bin
         ln -sf ~/.local/kitty.app/bin/kitty ~/.local/bin/kitty
     }
     _task_nerdfont() {
-        [[ -d "$FONT_DIR/FiraCode" ]] && return 0
+        # Guard on real font files, not just the directory: a failed download
+        # used to leave an empty dir that blocked every future retry.
+        compgen -G "$FONT_DIR/FiraCode/*.ttf" >/dev/null 2>&1 && return 0
         echo "[Linux] Installing FiraCode Nerd Font..."
         mkdir -p "$FONT_DIR/FiraCode"
-        wget -q -P "$FONT_DIR/FiraCode" \
-            https://github.com/ryanoasis/nerd-fonts/releases/latest/download/FiraCode.zip
+        if ! wget -q -P "$FONT_DIR/FiraCode" \
+            https://github.com/ryanoasis/nerd-fonts/releases/latest/download/FiraCode.zip; then
+            echo "[WARNING] FiraCode download failed; will retry on next run."
+            rm -f "$FONT_DIR/FiraCode/FiraCode.zip"
+            return 0
+        fi
         unzip -q "$FONT_DIR/FiraCode/FiraCode.zip" -d "$FONT_DIR/FiraCode"
         rm -f "$FONT_DIR/FiraCode/FiraCode.zip"
         fc-cache -f
@@ -447,8 +456,11 @@ if command -v nvim >/dev/null 2>&1; then
     [ -f "$LOCK_FILE" ] && LOCK_HASH="$(_sha256 "$LOCK_FILE")"
     if [ "$NVIM_VER_CHANGED" = 1 ] || [ ! -d "$NVIM_DATA_DIR/lazy" ] || [ "$LOCK_HASH" != "$(cat "$LOCK_STAMP" 2>/dev/null)" ]; then
         echo "[Neovim] Syncing plugins to lockfile..."
-        yes '' | nvim --headless "+Lazy! restore" +qa 2>/dev/null
-        echo "$LOCK_HASH" > "$LOCK_STAMP"
+        if yes '' | nvim --headless "+Lazy! restore" +qa 2>/dev/null; then
+            echo "$LOCK_HASH" > "$LOCK_STAMP"
+        else
+            echo "[WARNING] Lazy restore failed; plugins will re-sync next run."
+        fi
     else
         echo "[Neovim] Plugins already match the lockfile — skipping Lazy restore."
     fi
