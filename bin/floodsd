@@ -501,47 +501,35 @@ finally:
 PYEOF
 }
 
-# _fd_reach_probe <iface> <destip> <srcport>: real end-to-end reachability
-# check for the flood target. The UDP probe above only resolves the L2 next hop
-# (the gateway, when the target is off-subnet) and never waits for a reply, so
-# it proves nothing about whether packets actually cross the fabric to <destip>.
-# This does: it sends a UDP datagram from the pinned flood source port (same
-# egress treatment as the real flood -- plain ICMP ping has no source port to
-# pin and is dropped outbound here, which is why we can't just ping) to a high,
-# almost-certainly-closed port on <destip>, over a *connected* socket. If the
-# packet reaches <destip>, its kernel returns ICMP port-unreachable, surfaced as
-# ECONNREFUSED -- a positive "reachable end to end" signal. A timeout is
-# inconclusive (fabric blackhole outbound, OR the target silently dropping the
-# ICMP), so callers treat it as a WARNING, never a hard failure. Prints
-# REACHABLE / NOREPLY / ERR:<msg>.
-_fd_reach_probe() {
-    local iface=$1 destip=$2 srcport=$3
+# _fd_egress_probe <iface> <destip> <destport> <srcport>: does a flood-shaped
+# packet actually leave this box? The MAC-resolution probe above only proves we
+# resolved the L2 next hop; it says nothing about whether the flood itself
+# egresses. This sends one UDP datagram matching the flood (pinned src port,
+# real dst port) while capturing on <iface>, then checks whether it hit the
+# wire. That isolates the one failure the SENDER can see and fix -- a local
+# egress firewall (iptables/nftables OUTPUT) silently dropping the flood.
+#
+# Deliberately NOT a round-trip test: the flood target may receive via XDP/xsk
+# (caught before the kernel -> no ICMP) or firewall-reject unsolicited probes,
+# so waiting for a reply false-warns on perfectly healthy targets. Whether
+# packets survive the fabric to the far side can only be confirmed by a tcpdump
+# on the target while flooding -- we point the user there instead of guessing.
+# Prints LEFT / BLOCKED / NOTOOL / ERR:<msg>.
+_fd_egress_probe() {
+    local iface=$1 destip=$2 destport=$3 srcport=$4
+    command -v tcpdump >/dev/null 2>&1 || { echo "NOTOOL"; return; }
     command -v python3 >/dev/null 2>&1 || { echo "ERR:no-python3"; return; }
-    sudo python3 - "$iface" "$destip" "$srcport" <<'PYEOF'
-import socket, sys
-iface, destip, srcport = sys.argv[1], sys.argv[2], int(sys.argv[3])
-destport = 40404  # high port the target almost certainly isn't bound to
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-try:
-    s.setsockopt(socket.SOL_SOCKET, 25, iface.encode())  # SO_BINDTODEVICE
-except OSError:
-    pass
-try:
-    s.bind(('0.0.0.0', srcport))
-    s.settimeout(2.0)
-    s.connect((destip, destport))
-    s.send(b'floodsd-reach')
-    s.recv(1024)
-    print("REACHABLE")
-except ConnectionRefusedError:
-    print("REACHABLE")   # ICMP port-unreachable => end-to-end OK
-except socket.timeout:
-    print("NOREPLY")     # blackhole outbound, or ICMP silently dropped
-except OSError as e:
-    print(f"ERR:{e}")
-finally:
-    s.close()
-PYEOF
+    local cap
+    cap=$(mktemp /tmp/floodsd-egress-XXXXXX.pcap) || { echo "ERR:no-tmpfile"; return; }
+    sudo timeout 3 tcpdump -ni "$iface" -w "$cap" "udp port $srcport" >/dev/null 2>&1 &
+    local tpid=$!
+    sleep 0.3
+    _fd_udp_probe "$iface" "$destip" "$destport" "$srcport" >/dev/null 2>&1
+    wait "$tpid" 2>/dev/null
+    local seen=0
+    sudo test -s "$cap" && seen=$(sudo tcpdump -nr "$cap" 2>/dev/null | wc -l | tr -d ' ')
+    sudo rm -f "$cap"
+    if [ "${seen:-0}" -gt 0 ]; then echo "LEFT"; else echo "BLOCKED"; fi
 }
 
 # _fd_nexthop_ip <iface> <destip>: prints the IP whose MAC actually needs
@@ -742,30 +730,30 @@ _floodsd_setup() {
         fi
     fi
 
-    # Real end-to-end reachability (see _fd_reach_probe). MAC resolution above
-    # only confirmed the L2 next hop; this is the first thing that tells us
-    # whether packets actually reach $destip across the fabric. Advisory only --
-    # a NOREPLY is inconclusive, so it warns but never blocks saving the target.
-    echo "Testing end-to-end reachability to $destip (UDP from port $FLOOD_SPORT)..."
-    local _reach; _reach=$(_fd_reach_probe "$probeif" "$destip" "$FLOOD_SPORT")
-    case "$_reach" in
-        REACHABLE)
-            echo "  line test: REACHABLE -- $destip answered end to end. Good to flood."
+    # Egress check (see _fd_egress_probe): confirm a flood-shaped packet actually
+    # leaves this box. Catches a local egress firewall -- the one thing the
+    # sender can fix. It does NOT test whether packets survive the fabric to
+    # $destip (an XDP/firewalled target won't reply, so a round-trip test would
+    # false-warn); for that, tcpdump on the target while flooding. Advisory only.
+    echo "Checking the flood egresses $probeif (UDP src port $FLOOD_SPORT -> $destip:$FLOOD_DPORT)..."
+    local _egr; _egr=$(_fd_egress_probe "$probeif" "$destip" "$FLOOD_DPORT" "$FLOOD_SPORT")
+    case "$_egr" in
+        LEFT)
+            echo "  egress: OK -- a flood-shaped packet left $probeif. To confirm it reaches"
+            echo "  $destip, run 'sudo tcpdump -ni <iface> udp port $FLOOD_DPORT' there while flooding."
             ;;
-        NOREPLY)
-            echo "  line test: NO REPLY from $destip -- the flood may not be arriving."
-            echo "    The L2 next hop ($nexthop) resolved, but nothing came back from"
-            echo "    $destip itself. Likely a blackhole/ACL on the path; confirm with:"
-            echo "      traceroute -n $destip"
-            echo "    (If $destip merely drops the probe this is a false alarm -- verify"
-            echo "    with 'sudo tcpdump -ni <iface> udp port $FLOOD_DPORT' on the target"
-            echo "    while flooding.) Saving the target anyway."
+        BLOCKED)
+            echo "  egress: BLOCKED -- the probe never left $probeif. This box's own firewall is"
+            echo "    dropping it before the wire. Check: sudo nft list ruleset  /  sudo iptables -S OUTPUT"
+            echo "    for a rule keyed on src port $FLOOD_SPORT, dst port $FLOOD_DPORT, or $destip."
+            echo "    If the allowed source port differs, fix it with: floodsd setup-srcport"
+            echo "    Saving the target anyway."
             ;;
-        ERR:no-python3)
-            echo "  line test: skipped (python3 not found)."
+        NOTOOL)
+            echo "  egress: skipped (tcpdump not found -- install it to auto-check flood egress)."
             ;;
         ERR:*)
-            echo "  line test: errored (${_reach#ERR:}) -- skipping."
+            echo "  egress: check errored (${_egr#ERR:}) -- skipping."
             ;;
     esac
 
