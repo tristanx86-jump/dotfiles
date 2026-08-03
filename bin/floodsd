@@ -501,6 +501,49 @@ finally:
 PYEOF
 }
 
+# _fd_reach_probe <iface> <destip> <srcport>: real end-to-end reachability
+# check for the flood target. The UDP probe above only resolves the L2 next hop
+# (the gateway, when the target is off-subnet) and never waits for a reply, so
+# it proves nothing about whether packets actually cross the fabric to <destip>.
+# This does: it sends a UDP datagram from the pinned flood source port (same
+# egress treatment as the real flood -- plain ICMP ping has no source port to
+# pin and is dropped outbound here, which is why we can't just ping) to a high,
+# almost-certainly-closed port on <destip>, over a *connected* socket. If the
+# packet reaches <destip>, its kernel returns ICMP port-unreachable, surfaced as
+# ECONNREFUSED -- a positive "reachable end to end" signal. A timeout is
+# inconclusive (fabric blackhole outbound, OR the target silently dropping the
+# ICMP), so callers treat it as a WARNING, never a hard failure. Prints
+# REACHABLE / NOREPLY / ERR:<msg>.
+_fd_reach_probe() {
+    local iface=$1 destip=$2 srcport=$3
+    command -v python3 >/dev/null 2>&1 || { echo "ERR:no-python3"; return; }
+    sudo python3 - "$iface" "$destip" "$srcport" <<'PYEOF'
+import socket, sys
+iface, destip, srcport = sys.argv[1], sys.argv[2], int(sys.argv[3])
+destport = 40404  # high port the target almost certainly isn't bound to
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.setsockopt(socket.SOL_SOCKET, 25, iface.encode())  # SO_BINDTODEVICE
+except OSError:
+    pass
+try:
+    s.bind(('0.0.0.0', srcport))
+    s.settimeout(2.0)
+    s.connect((destip, destport))
+    s.send(b'floodsd-reach')
+    s.recv(1024)
+    print("REACHABLE")
+except ConnectionRefusedError:
+    print("REACHABLE")   # ICMP port-unreachable => end-to-end OK
+except socket.timeout:
+    print("NOREPLY")     # blackhole outbound, or ICMP silently dropped
+except OSError as e:
+    print(f"ERR:{e}")
+finally:
+    s.close()
+PYEOF
+}
+
 # _fd_nexthop_ip <iface> <destip>: prints the IP whose MAC actually needs
 # resolving to reach <destip> out <iface> — <destip> itself if it's on-link
 # (same subnet, no router), or the next-hop router's IP if <destip> is a
@@ -699,10 +742,37 @@ _floodsd_setup() {
         fi
     fi
 
+    # Real end-to-end reachability (see _fd_reach_probe). MAC resolution above
+    # only confirmed the L2 next hop; this is the first thing that tells us
+    # whether packets actually reach $destip across the fabric. Advisory only --
+    # a NOREPLY is inconclusive, so it warns but never blocks saving the target.
+    echo "Testing end-to-end reachability to $destip (UDP from port $FLOOD_SPORT)..."
+    local _reach; _reach=$(_fd_reach_probe "$probeif" "$destip" "$FLOOD_SPORT")
+    case "$_reach" in
+        REACHABLE)
+            echo "  line test: REACHABLE -- $destip answered end to end. Good to flood."
+            ;;
+        NOREPLY)
+            echo "  line test: NO REPLY from $destip -- the flood may not be arriving."
+            echo "    The L2 next hop ($nexthop) resolved, but nothing came back from"
+            echo "    $destip itself. Likely a blackhole/ACL on the path; confirm with:"
+            echo "      traceroute -n $destip"
+            echo "    (If $destip merely drops the probe this is a false alarm -- verify"
+            echo "    with 'sudo tcpdump -ni <iface> udp port $FLOOD_DPORT' on the target"
+            echo "    while flooding.) Saving the target anyway."
+            ;;
+        ERR:no-python3)
+            echo "  line test: skipped (python3 not found)."
+            ;;
+        ERR:*)
+            echo "  line test: errored (${_reach#ERR:}) -- skipping."
+            ;;
+    esac
+
     _floodsd_set if "$iface"
     _floodsd_set destip "$destip"
     _floodsd_set destmac "$destmac"
-    echo "Target confirmed: $destip via $nexthop ($destmac) reachable via $probeif — will flood from $iface."
+    echo "Target saved: $destip via $nexthop ($destmac) -- flooding from $iface (L2 next hop resolved; see line test above)."
 }
 
 # floodsd setup-srcport: override the UDP source port the probe, kernel
@@ -913,6 +983,24 @@ _floodsd_kernel() {
         echo "floodsd kernel: no target configured — run 'floodsd setup' first."
         return 1
     fi
+
+    # Source IP for the flood. pktgen sets NO source address by default, so
+    # packets egress with src 0.0.0.0 -- a martian that routers drop (uRPF /
+    # RFC 1812 bogon filtering), so an off-subnet flood silently never arrives
+    # even though pktgen reports 0 errors. The DPDK path already pins src ip;
+    # mirror it here. Prefer the source the kernel would pick for the target
+    # (correct even on a bond, where the IP lives on the master, not the
+    # slaves we inject from), falling back to the iface's own IPv4.
+    local srcip
+    srcip=$(ip -4 route get "$destip" 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)
+    if [ -z "$srcip" ]; then
+        srcip=$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    fi
+    if [ -z "$srcip" ]; then
+        echo "floodsd kernel: couldn't determine a source IP -- pktgen would send from 0.0.0.0 (a martian routers drop). Assign an IPv4 to '$iface' (or its bond master) and re-run 'floodsd setup'."
+        return 1
+    fi
+    echo "Source IP: $srcip (pktgen defaults to 0.0.0.0 -- a martian routers drop; pinning to the real source)."
     if ! ip link show "$iface" >/dev/null 2>&1; then
         echo "floodsd kernel: interface '$iface' not found (was it rebound to vfio-pci? check 'floodsd restore')."
         return 1
@@ -986,7 +1074,7 @@ _floodsd_kernel() {
     # iface B its queues 0,1,2.., rather than a shared 0..ncores that could run
     # off the end of one NIC's queue count). devs[] records every device name
     # so the rate/delay/cleanup helpers can act on all of them.
-    local i core dev thread cmd ifidx qidx
+    local i core dev thread cmd ifidx qidx srcmac
     local -a devs=()
     local -a ifq   # per-interface queue counter
     for ((i = 0; i < niface; i++)); do ifq[$i]=0; done
@@ -996,6 +1084,10 @@ _floodsd_kernel() {
         ifidx=$((i % niface))
         iface="${ifaces[$ifidx]}"
         qidx=${ifq[$ifidx]}
+        # Pin src MAC to this flooding interface's own MAC (an 802.3ad slave
+        # already carries the bond master's MAC, so this is what the switch
+        # expects); pktgen would otherwise use whatever the device defaults to.
+        srcmac=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
         ifq[$ifidx]=$((qidx + 1))
         # Device name suffix is the per-interface queue index (matches
         # queue_map below). Unique per interface, and each slave's queues start
@@ -1014,6 +1106,8 @@ _floodsd_kernel() {
         for cmd in "count 0" "clone_skb 1000" "pkt_size 64" \
                    "queue_map_min $qidx" "queue_map_max $qidx" \
                    "dst $destip" "dst_mac $destmac" \
+                   "src_min $srcip" "src_max $srcip" \
+                   ${srcmac:+"src_mac $srcmac"} \
                    "flag UDPSRC_RND" \
                    "udp_src_min $sport_lo" "udp_src_max $sport_hi" \
                    "udp_dst_min $FLOOD_DPORT" "udp_dst_max $FLOOD_DPORT"; do
