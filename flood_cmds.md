@@ -1,13 +1,11 @@
 # Flood Load Generation
 
 `floodsd` ("flood standalone") load-tests a remote firedancer validator from a
-*separate* box — same idea as `pktfd`'s DPDK pktgen, but aimed at a target over
-the wire instead of a physical-loopback rig. Always sends 64B (min-sized) UDP
-packets at dport 9000.
+*separate* box, aimed at a target over the wire. Always sends 64B (min-sized)
+UDP packets at dport 9000.
 
-It's a single self-contained bash script: no zsh, no dotfiles, nothing sourced
-into any shell. Safe to drop on someone else's box; this is what you want on a
-remote sender.
+It's a single self-contained bash script: no zsh, nothing sourced into any
+shell.
 
 Two flood engines, chosen explicitly per run:
 
@@ -17,17 +15,17 @@ Two flood engines, chosen explicitly per run:
 
 ## Install
 
-From a clone of this dotfiles repo on the sending box:
+From a clone of the repo on the sending box:
 
 ```sh
 bash install-floodsd.sh
 ```
 
 Copies `bin/floodsd` to `~/.local/bin` (never system-wide) and installs
-`updateflood` alongside it. Installs nothing else — no themes, oh-my-zsh,
-nvim/tmux/kitty config, or shell rc changes. If `~/.local/bin` isn't on your
-PATH it offers (opt-in) to add it. DPDK/Pktgen-DPDK is only installed lazily
-on first `floodsd dpdk` run, with its own prompt.
+`updateflood` alongside it. Installs nothing else and makes no shell rc
+changes. If `~/.local/bin` isn't on your PATH it offers (opt-in) to add it.
+DPDK/Pktgen-DPDK is only installed lazily on first `floodsd dpdk` run, with
+its own prompt.
 
 Refresh later with `updateflood` — re-fetches the repo and re-runs the
 installer; updates `floodsd` only, installs nothing new, makes no rc changes.
