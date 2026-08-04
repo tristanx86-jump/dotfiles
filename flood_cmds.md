@@ -15,20 +15,9 @@ Two flood engines, chosen explicitly per run:
 
 ## Install
 
-From a clone of the repo on the sending box:
-
 ```sh
-bash install-floodsd.sh
+git clone https://github.com/tristanx86-jump/dotfiles.git ~/dotfiles 2>/dev/null || (cd ~/dotfiles && git fetch && git reset --hard origin/main) && chmod +x ~/dotfiles/install-floodsd.sh && ~/dotfiles/install-floodsd.sh
 ```
-
-Copies `bin/floodsd` to `~/.local/bin` (never system-wide) and installs
-`updateflood` alongside it. Installs nothing else and makes no shell rc
-changes. If `~/.local/bin` isn't on your PATH it offers (opt-in) to add it.
-DPDK/Pktgen-DPDK is only installed lazily on first `floodsd dpdk` run, with
-its own prompt.
-
-Refresh later with `updateflood` — re-fetches the repo and re-runs the
-installer; updates `floodsd` only, installs nothing new, makes no rc changes.
 
 ## Commands
 
