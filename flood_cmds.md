@@ -30,10 +30,3 @@ git clone https://github.com/tristanx86-jump/dotfiles.git ~/dotfiles 2>/dev/null
 | `floodsd kernel [--multiport]` | Configure in-kernel pktgen threads (top-down cores) at a target Mpps (or MAX), start the flood, and show a live Mpps counter. |
 | `floodsd stop` | Stop the in-kernel pktgen flood (`floodsd kernel`'s Ctrl-C only stops watching, not the traffic). |
 | `floodsd restore` | Undo `floodsd dpdk`'s vfio-pci bind — return the NIC to its kernel driver (and reattach a detached bond slave). |
-
-**Bonded NICs:** `setup` accepts a bond master or a slave. A slave alone
-can't resolve the target's MAC (bonding reassigns inbound replies to the
-master), so `setup` probes via the master while recording the slave to flood
-from. Neither engine can drive a bond master directly, so if the saved
-target is a bond master both engines prompt for a slave; `floodsd dpdk`
-offers to pull it out of the bond first and `floodsd restore` puts it back.
