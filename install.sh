@@ -345,9 +345,38 @@ _task_treesitter_cli() {
         || { echo "[WARNING] tree-sitter CLI install failed; nvim-treesitter parsers won't build."; return 1; }
 }
 _task_ohmyzsh() {
-    [ -d "$HOME/.oh-my-zsh" ] && return 0
+    # Guard on the framework loader, not just the directory: a gutted install
+    # (only custom/ surviving, e.g. an interrupted update) leaves ~/.oh-my-zsh
+    # present but oh-my-zsh.sh missing, so .zshrc's `[ -f $ZSH/oh-my-zsh.sh ]`
+    # guard silently skips OMZ entirely — no theme, no plugins, bare prompt.
+    # A plain `[ -d ~/.oh-my-zsh ]` check would call that "installed" forever.
+    [ -f "$HOME/.oh-my-zsh/oh-my-zsh.sh" ] && return 0
+
+    # Self-heal a gutted/partial install: the upstream installer refuses a
+    # non-empty ~/.oh-my-zsh, so move it aside first, preserving custom/
+    # (holds the p10k theme) to restore after the fresh clone.
+    local saved_custom=""
+    if [ -d "$HOME/.oh-my-zsh" ]; then
+        echo "[Shell] ~/.oh-my-zsh present but oh-my-zsh.sh missing — repairing..."
+        if [ -d "$HOME/.oh-my-zsh/custom" ]; then
+            saved_custom="$(mktemp -d)/custom"
+            cp -a "$HOME/.oh-my-zsh/custom" "$saved_custom"
+        fi
+        rm -rf "$HOME/.oh-my-zsh.broken"
+        mv "$HOME/.oh-my-zsh" "$HOME/.oh-my-zsh.broken"
+    fi
+
     echo "[Shell] Installing Oh-My-Zsh..."
-    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+    # RUNZSH/CHSH/KEEP_ZSHRC: don't drop into zsh, don't touch the login shell
+    # or .zshrc — install.sh manages those itself further down.
+    RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
+        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+
+    # Restore the preserved custom/ (p10k theme etc.) over the fresh empty one.
+    if [ -n "$saved_custom" ] && [ -d "$saved_custom" ]; then
+        cp -a "$saved_custom/." "$HOME/.oh-my-zsh/custom/"
+        rm -rf "$(dirname "$saved_custom")"
+    fi
 }
 _task_p10k() {
     local dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
