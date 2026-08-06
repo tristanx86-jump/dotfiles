@@ -49,13 +49,28 @@ create_symlink "$DOTFILES_DIR/zsh/.p10k.zsh"    "$HOME/.p10k.zsh"
 create_symlink "$DOTFILES_DIR/zsh/.bashrc"       "$HOME/.bashrc"
 create_symlink "$DOTFILES_DIR/zsh/.bash_profile" "$HOME/.bash_profile"
 
-# Set zsh as the login shell (macOS: chsh should always work).
+# Set zsh as the login shell — but only when a switch is actually needed and
+# can succeed non-interactively. If the current login shell is already *a* zsh
+# (e.g. Apple's /bin/zsh), leave it: chsh here only nags for a password to swap
+# one zsh for another (Homebrew's), for no real gain. And chsh only accepts a
+# target listed in /etc/shells; a target that isn't there prompts for a password
+# and then fails anyway — so skip it and tell the user how to opt in.
 ZSH_BIN="$(command -v zsh 2>/dev/null)"
-if [ -n "$ZSH_BIN" ] && [ "$SHELL" != "$ZSH_BIN" ]; then
-    chsh -s "$ZSH_BIN" 2>/dev/null \
-        && echo "[Shell] Login shell set to $ZSH_BIN." \
-        || echo "[WARN] chsh failed — run manually: chsh -s $ZSH_BIN"
-fi
+case "$SHELL" in
+    *zsh) ;;  # already on a zsh login shell — nothing to do
+    *)
+        if [ -n "$ZSH_BIN" ]; then
+            if grep -qx "$ZSH_BIN" /etc/shells 2>/dev/null; then
+                chsh -s "$ZSH_BIN" 2>/dev/null \
+                    && echo "[Shell] Login shell set to $ZSH_BIN." \
+                    || echo "[WARN] chsh failed — run manually: chsh -s $ZSH_BIN"
+            else
+                echo "[Shell] $ZSH_BIN not in /etc/shells; leaving login shell as $SHELL."
+                echo "        To use it: sudo sh -c 'echo $ZSH_BIN >> /etc/shells' && chsh -s $ZSH_BIN"
+            fi
+        fi
+        ;;
+esac
 
 # oh-my-zsh (git clone, no curl-pipe-sh)
 if [ ! -d "$HOME/.oh-my-zsh" ]; then
