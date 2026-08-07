@@ -908,14 +908,28 @@ _fd_kernel_thread_has_devices() {
 _fd_kernel_cleanup_all() {
     echo "stop" | sudo tee /proc/net/pktgen/pgctrl >/dev/null 2>&1
 
-    local hi=$(( $(nproc) - 1 )) n attempt leftover
+    # Sweep the pktgen threads that ACTUALLY EXIST (glob the proc dir), NOT a
+    # 0..nproc-1 range. pktgen creates one kpktgend_N per CPU present when the
+    # module loaded and they persist for the module's lifetime -- but nproc
+    # reflects only currently-*online* CPUs. If cores were offlined (or this
+    # process runs under a reduced affinity mask) after a flood was set up,
+    # nproc shrinks while the high-numbered threads (and their attached
+    # devices) live on. An nproc-bounded loop then skips exactly those threads
+    # AND its verification skips them too -- so it reports "all detached" while
+    # stale devices survive up top. Since pktgen device names (iface@N) are
+    # GLOBAL across threads, those survivors then EBUSY every new add_device.
+    # Globbing the real thread files covers every thread regardless of the
+    # current online-CPU count.
+    local f n attempt leftover
     for attempt in 1 2; do
-        for ((n = 0; n <= hi; n++)); do
-            [ -e "/proc/net/pktgen/kpktgend_${n}" ] || continue
-            echo "rem_device_all" | sudo tee "/proc/net/pktgen/kpktgend_${n}" >/dev/null 2>&1
+        for f in /proc/net/pktgen/kpktgend_*; do
+            [ -e "$f" ] || continue
+            echo "rem_device_all" | sudo tee "$f" >/dev/null 2>&1
         done
         leftover=0
-        for ((n = 0; n <= hi; n++)); do
+        for f in /proc/net/pktgen/kpktgend_*; do
+            [ -e "$f" ] || continue
+            n=${f##*/kpktgend_}
             _fd_kernel_thread_has_devices "$n" && leftover=$((leftover + 1))
         done
         [ "$leftover" -eq 0 ] && return 0
