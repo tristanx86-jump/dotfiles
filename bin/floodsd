@@ -1084,6 +1084,7 @@ _floodsd_kernel() {
         devs+=("$dev")
 
         if ! _fd_kernel_write "/proc/net/pktgen/$thread" "add_device $dev"; then
+            echo "  If this is 'Device or resource busy', a previous kernel flood is still attached to the pktgen threads (e.g. a lost SSH session): run 'floodsd stop' to tear it down, then retry 'floodsd kernel'."
             echo "  If this is 'Permission denied' despite running as root, it's very likely SELinux (common on hardened RHEL-family boxes):"
             echo "    getenforce                                 # check if it's Enforcing"
             echo "    sudo ausearch -m avc -ts recent | grep -i pktgen   # see the actual denial"
@@ -1243,14 +1244,25 @@ _floodsd_kernel() {
     done
 }
 
-# floodsd stop: halt the in-kernel pktgen flood from a separate shell —
-# devices stay configured. Exists as a kill switch independent of the
-# interactive prompt above: kernel pktgen state outlives the shell that
-# configured it, so if that session dies (SSH drop, closed terminal) while
-# a flood is running, this is how you stop it.
+# floodsd stop: full kill switch for the in-kernel pktgen flood from a
+# separate shell — stops sending AND detaches every device. Independent of
+# the interactive prompt above: kernel pktgen state outlives the shell that
+# configured it, so if that session dies (SSH drop, closed terminal) while a
+# flood is running, its devices stay bound to the pktgen threads and the next
+# ‘floodsd kernel’ fails with ‘Device or resource busy’ — this clears that.
 _floodsd_stop() {
-    echo "stop" | sudo tee /proc/net/pktgen/pgctrl >/dev/null 2>&1
-    echo "Kernel pktgen stopped."
+    # Full teardown, not just pgctrl: stop sending AND rem_device_all across
+    # every kpktgend_N thread (verified), exactly like the interactive prompt's
+    # 'quit'. A lost kernel session (SSH drop / closed terminal) leaves its
+    # devices bound to the pktgen threads; a plain 'stop' would leave them there
+    # and the next 'floodsd kernel' fails with 'add_device ... Device or resource
+    # busy'. Tearing everything down here means 'floodsd kernel' starts clean.
+    if _fd_kernel_cleanup_all; then
+        echo "Kernel pktgen stopped and all devices detached."
+    else
+        echo "Kernel pktgen stopped, but some devices could not be detached (see warning above)." >&2
+        return 1
+    fi
 }
 
 # _floodsd_ensure_dpdk: install DPDK + build Pktgen-DPDK from source if it
