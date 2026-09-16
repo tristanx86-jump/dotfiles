@@ -31,6 +31,9 @@ fi
 STATE_DIR="$HOME/.cache/dotfiles"
 mkdir -p "$STATE_DIR"
 
+# Prefer user-owned tools installed by this script over incompatible system copies.
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
 # -----------------------------------------------------------------------------
 # Original-state snapshot (for `wipedot`)
 # -----------------------------------------------------------------------------
@@ -330,19 +333,27 @@ fi
 # -----------------------------------------------------------------------------
 # tree-sitter CLI, Oh-My-Zsh, Powerlevel10k, TPM
 # -----------------------------------------------------------------------------
-# Four independent installs (npm global package + three git-based installs),
-# none depending on each other — run them concurrently. (The tree-sitter-cli
-# sudo fallback relies on the credential cache from `sudo -v` at the top of
-# this script on Linux; on macOS it's essentially never hit since brew's npm
-# prefix is user-writable.)
+# Four independent installs, none depending on each other, run concurrently.
+# Build tree-sitter-cli from source when possible so it uses the host's libc.
+_treesitter_cli_works() {
+    command -v tree-sitter >/dev/null 2>&1 && tree-sitter --version >/dev/null 2>&1
+}
 _task_treesitter_cli() {
-    command -v tree-sitter >/dev/null 2>&1 && return 0
+    _treesitter_cli_works && return 0
     echo "[Neovim] Installing tree-sitter CLI..."
-    # Plain install works where the npm prefix is user-writable (brew); fall
-    # back to sudo for system prefixes (apt's /usr/local).
-    npm install -g tree-sitter-cli 2>/dev/null \
-        || sudo npm install -g tree-sitter-cli \
-        || { echo "[WARNING] tree-sitter CLI install failed; nvim-treesitter parsers won't build."; return 1; }
+    if command -v cargo >/dev/null 2>&1; then
+        cargo install tree-sitter-cli --locked --root "$HOME/.local" || return 1
+    elif command -v npm >/dev/null 2>&1; then
+        npm install -g --prefix "$HOME/.local" tree-sitter-cli || return 1
+    else
+        echo "[WARNING] tree-sitter CLI needs cargo or npm."
+        return 1
+    fi
+    hash -r
+    _treesitter_cli_works || {
+        echo "[WARNING] installed tree-sitter CLI cannot run on this host."
+        return 1
+    }
 }
 _task_ohmyzsh() {
     # Guard on the framework loader, not just the directory: a gutted install
@@ -485,7 +496,7 @@ if command -v nvim >/dev/null 2>&1; then
     [ -f "$LOCK_FILE" ] && LOCK_HASH="$(_sha256 "$LOCK_FILE")"
     if [ "$NVIM_VER_CHANGED" = 1 ] || [ ! -d "$NVIM_DATA_DIR/lazy" ] || [ "$LOCK_HASH" != "$(cat "$LOCK_STAMP" 2>/dev/null)" ]; then
         echo "[Neovim] Syncing plugins to lockfile..."
-        if yes '' | nvim --headless "+Lazy! restore" +qa 2>/dev/null; then
+        if nvim --headless "+Lazy! restore" +qa; then
             echo "$LOCK_HASH" > "$LOCK_STAMP"
         else
             echo "[WARNING] Lazy restore failed; plugins will re-sync next run."
@@ -500,7 +511,7 @@ if command -v nvim >/dev/null 2>&1; then
     done
     if [ "$NVIM_VER_CHANGED" = 1 ] || [ "$TS_MISSING" = 1 ]; then
         echo "[Neovim] Building treesitter parsers..."
-        yes '' | nvim --headless "+lua require('nvim-treesitter').install({'c','cpp','lua','rust','python','bash'}):wait(300000)" +qa 2>/dev/null \
+        nvim --headless "+lua require('nvim-treesitter').install({'c','cpp','lua','rust','python','bash'}):wait(300000)" +qa \
             || echo "[WARNING] treesitter parser build failed; open nvim and run :TSUpdate."
     else
         echo "[Neovim] Treesitter parsers already installed — skipping build."
