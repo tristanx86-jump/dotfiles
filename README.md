@@ -20,9 +20,9 @@ git clone https://github.com/tristanx86-jump/dotfiles.git ~/dotfiles 2>/dev/null
 
 ## Reduced / client setup
 
-For a restricted machine. `install-client.sh` never uses `sudo` — it's
-mainly for setting up the terminal and host/SSH management (`s`/`sfd`, see
-`host_cmds.md` / `hostdot`).
+For a restricted machine. `install-client.sh` never uses `sudo`. It installs
+FiraCode Nerd Font for the current macOS user, then sets up the terminal and
+host/SSH management (`s`/`sfd`, see `host_cmds.md` / `hostdot`).
 
 ```bash
 git clone https://github.com/tristanx86-jump/dotfiles.git ~/dotfiles 2>/dev/null || (git -C ~/dotfiles remote set-url origin https://github.com/tristanx86-jump/dotfiles.git && git -C ~/dotfiles fetch origin main && git -C ~/dotfiles reset --hard origin/main) && chmod +x ~/dotfiles/install-client.sh && ~/dotfiles/install-client.sh && exec zsh

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Minimal setup for a client / jump machine (corporate MacBook, restricted env).
-# Only symlinks dotfiles and configures tools that are already installed.
+# Symlinks dotfiles, installs a user-local terminal font, and configures tools
+# that are already installed.
 # Does NOT install Homebrew packages or run curl-pipe-sh installers.
 #
 # What this sets up:
 #   - zsh config (oh-my-zsh + p10k, installed via git if missing)
 #   - tmux config (if tmux is installed)
 #   - nvim config (if nvim is installed)
+#   - FiraCode Nerd Font in the current macOS user account
 #   - iTerm2 TokyoNight profile + default profile + clipboard access
 #   - The `s` / `sfd` functions for connecting to your dev servers
 #
@@ -39,6 +41,41 @@ try_git_clone() {
     echo "[Client] Installing $label..."
     git clone --depth=1 "$url" "$dest" \
         || echo "[WARN] $label install failed — network may be restricted. Install manually later."
+}
+
+install_macos_nerd_font() {
+    local user_font_dir="$HOME/Library/Fonts"
+    local regular_font="$user_font_dir/FiraCodeNerdFontMono-Regular.ttf"
+    [ -f "$regular_font" ] && return 0
+
+    local temp_dir archive
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-font.XXXXXX")" || {
+        echo "[WARN] Could not create temporary directory for FiraCode Nerd Font."
+        return 1
+    }
+    archive="$temp_dir/FiraCode.zip"
+    echo "[Client] Installing FiraCode Nerd Font for the current user..."
+    if ! curl -fL --retry 3 \
+        https://github.com/ryanoasis/nerd-fonts/releases/latest/download/FiraCode.zip \
+        -o "$archive"; then
+        echo "[WARN] FiraCode Nerd Font download failed."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    mkdir -p "$user_font_dir"
+    if ! ditto -x -k "$archive" "$temp_dir/unpacked"; then
+        echo "[WARN] FiraCode Nerd Font extraction failed."
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    find "$temp_dir/unpacked" -type f -name '*.ttf' \
+        -exec cp -f {} "$user_font_dir/" \;
+    rm -rf "$temp_dir"
+    if [ ! -f "$regular_font" ]; then
+        echo "[WARN] FiraCode Nerd Font archive did not contain the expected font."
+        return 1
+    fi
+    echo "[Client] FiraCode Nerd Font installed in $user_font_dir."
 }
 
 # -----------------------------------------------------------------------------
@@ -110,6 +147,10 @@ fi
 # -----------------------------------------------------------------------------
 # iTerm2
 # -----------------------------------------------------------------------------
+if [ "$(uname -s)" = "Darwin" ]; then
+    install_macos_nerd_font || true
+fi
+
 ITERM_DIR="$HOME/Library/Application Support/iTerm2"
 if [ -d "$ITERM_DIR" ]; then
     mkdir -p "$ITERM_DIR/DynamicProfiles"
