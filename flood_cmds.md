@@ -13,7 +13,7 @@ with a target-Mpps rate limit and a live Mpps monitor.
 ## Install
 
 ```sh
-git clone https://github.com/tristanx86-jump/dotfiles.git ~/dotfiles 2>/dev/null || (cd ~/dotfiles && git fetch && git reset --hard origin/main) && chmod +x ~/dotfiles/install-floodsd.sh && ~/dotfiles/install-floodsd.sh
+git clone https://github.com/tristanx86-jump/dotfiles.git ~/dotfiles 2>/dev/null || (git -C ~/dotfiles remote set-url origin https://github.com/tristanx86-jump/dotfiles.git && git -C ~/dotfiles fetch origin main && git -C ~/dotfiles reset --hard origin/main) && chmod +x ~/dotfiles/install-floodsd.sh && ~/dotfiles/install-floodsd.sh
 ```
 
 ## Commands

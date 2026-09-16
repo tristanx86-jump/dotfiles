@@ -188,6 +188,24 @@ function updatedot() {
     if [ ! -d ~/dotfiles/.git ]; then
         git clone "$DOTFILES_REPO_URL" ~/dotfiles || return 1
     else
+        local origin
+        origin="$(git -C ~/dotfiles config --get remote.origin.url 2>/dev/null)"
+        case "$origin" in
+            "https://github.com/$DOTFILES_REPO_OWNER/dotfiles"|\
+            "https://github.com/$DOTFILES_REPO_OWNER/dotfiles.git"|\
+            "git@github.com:$DOTFILES_REPO_OWNER/dotfiles"|\
+            "git@github.com:$DOTFILES_REPO_OWNER/dotfiles.git"|\
+            "ssh://git@github.com/$DOTFILES_REPO_OWNER/dotfiles"|\
+            "ssh://git@github.com/$DOTFILES_REPO_OWNER/dotfiles.git") ;;
+            *)
+                echo "updatedot: correcting origin from ${origin:-<missing>} to $DOTFILES_REPO_URL"
+                if [ -n "$origin" ]; then
+                    git -C ~/dotfiles remote set-url origin "$DOTFILES_REPO_URL" || return 1
+                else
+                    git -C ~/dotfiles remote add origin "$DOTFILES_REPO_URL" || return 1
+                fi
+                ;;
+        esac
         # Refuse to clobber local work: fast-forward pull only, never a hard
         # reset. If the tree is dirty or diverged, stop and let the user decide
         # instead of silently discarding their edits.

@@ -54,12 +54,30 @@ cat > "$dest_dir/updateflood" <<'UPDATEFLOOD'
 # nothing new, makes no shell/rc changes. The floodsd parallel to updatedot.
 set -uo pipefail
 REPO_DIR="__DOTFILES_DIR__"
+REPO_URL="https://github.com/tristanx86-jump/dotfiles.git"
 [ -d "$REPO_DIR/.git" ] || REPO_DIR="$HOME/dotfiles"
 if [ ! -d "$REPO_DIR/.git" ]; then
     echo "[updateflood] dotfiles repo not found at $REPO_DIR -- clone it first." >&2
     exit 1
 fi
 cd "$REPO_DIR" || exit 1
+origin="$(git config --get remote.origin.url 2>/dev/null)"
+case "$origin" in
+    https://github.com/tristanx86-jump/dotfiles|\
+    https://github.com/tristanx86-jump/dotfiles.git|\
+    git@github.com:tristanx86-jump/dotfiles|\
+    git@github.com:tristanx86-jump/dotfiles.git|\
+    ssh://git@github.com/tristanx86-jump/dotfiles|\
+    ssh://git@github.com/tristanx86-jump/dotfiles.git) ;;
+    *)
+        echo "[updateflood] Correcting origin from ${origin:-<missing>} to $REPO_URL"
+        if [ -n "$origin" ]; then
+            git remote set-url origin "$REPO_URL" || exit 1
+        else
+            git remote add origin "$REPO_URL" || exit 1
+        fi
+        ;;
+esac
 echo "[updateflood] Fetching latest from $REPO_DIR..."
 git fetch && git reset --hard origin/main || {
     echo "[updateflood] git update failed." >&2; exit 1; }
