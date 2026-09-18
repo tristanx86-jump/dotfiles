@@ -6,22 +6,22 @@
 # stored per-device in an untracked file (defaults to firedancer-dev).
 FD_BIN_FILE="$HOME/.config/dotfiles/fdbin"
 _fdbin() { cat "$FD_BIN_FILE" 2>/dev/null || echo firedancer-dev; }
-# Resolve binary to absolute path so sudo can find it regardless of secure_path
-# (needed on RHEL/Fedora). Falls back to the repo's own build output
-# (build/<target>/<compiler>/bin/<name>, e.g. build/native/gcc/bin/firedancer-dev)
-# when the binary isn't on PATH — some distros (Rocky et al.) don't get that
-# directory on PATH any other way, which otherwise means manually symlinking
-# the binary somewhere on PATH before every fd command works.
+# _fdbinpath uses Make's build directory, matching makefd's current settings.
+# Return an absolute path so sudo does not need the binary on PATH.
 _fdbinpath() {
-    local name; name=$(_fdbin)
-    local found; found=$(command -v "$name" 2>/dev/null)
-    [ -n "$found" ] && { echo "$found"; return; }
-    local candidates=(build/*/*/bin/$name(N.Om[1]))
-    if [ ${#candidates} -ge 1 ]; then
-        echo "$PWD/${candidates[1]}"
-        return
+    local name objdir bin
+    name=$(_fdbin) || return
+    objdir=$(make -s --no-print-directory objdir) || {
+        print -u2 -- "fd: cannot determine the build directory. Run from the Firedancer checkout with makefd's build settings."
+        return 1
+    }
+    bin="$objdir/bin/$name"
+    bin="${bin:a}"
+    if [[ ! -f "$bin" || ! -x "$bin" ]]; then
+        print -u2 -- "fd: executable missing: $bin. Run makefd with the same build settings."
+        return 1
     fi
-    echo "$name"
+    print -r -- "$bin"
 }
 # Make target(s) for the current binary. fddev also needs the solana target.
 _fdtarget() { case "$(_fdbin)" in fddev) echo "fddev solana";; *) echo "$(_fdbin)";; esac; }
@@ -90,21 +90,43 @@ unalias makefd updatefd pktfd devfd testnetfd flamefd metricsfd memfd initfd fin
 # copies the command it would have run.
 function makefd()    { make -j"${MAKE_JOBS:-8}" $(_fdtarget); }
 function devfd() {
-    if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$(_fdbinpath)" dev --config "$(_fdconfig)" "$@"; return; fi
-    _fd_dispatch "$1" sudo "$(_fdbinpath)" dev --config "$(_fdconfig)"
+    local bin
+    bin=$(_fdbinpath) || return
+    if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$bin" dev --config "$(_fdconfig)" "$@"; return; fi
+    _fd_dispatch "$1" sudo "$bin" dev --config "$(_fdconfig)"
 }
 function testnetfd() {
-    if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$(_fdbinpath)" --testnet --config "$(_fdconfig)" "$@"; return; fi
-    _fd_dispatch "$1" sudo "$(_fdbinpath)" --testnet --config "$(_fdconfig)"
+    local bin
+    bin=$(_fdbinpath) || return
+    if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$bin" --testnet --config "$(_fdconfig)" "$@"; return; fi
+    _fd_dispatch "$1" sudo "$bin" --testnet --config "$(_fdconfig)"
 }
-function flamefd()   { _fd_dispatch "$1" sudo "$(_fdbinpath)" flame --config "$(_fdconfig)"; }    # perf flamegraph
-function metricsfd() { _fd_dispatch "$1" sudo "$(_fdbinpath)" metrics --config "$(_fdconfig)"; }  # Prometheus metrics
+function flamefd() {
+    local bin
+    bin=$(_fdbinpath) || return
+    _fd_dispatch "$1" sudo "$bin" flame --config "$(_fdconfig)"
+}
+function metricsfd() {
+    local bin
+    bin=$(_fdbinpath) || return
+    _fd_dispatch "$1" sudo "$bin" metrics --config "$(_fdconfig)"
+}
 function memfd() {
-    if [ "$1" = cmd ]; then _fd_show sudo "$(_fdbinpath)" mem --config "$(_fdconfig)"; return; fi
-    sudo "$(_fdbinpath)" mem --config "$(_fdconfig)" | less
+    local bin
+    bin=$(_fdbinpath) || return
+    if [ "$1" = cmd ]; then _fd_show sudo "$bin" mem --config "$(_fdconfig)"; return; fi
+    sudo "$bin" mem --config "$(_fdconfig)" | less
 }
-function initfd()    { _fd_dispatch "$1" sudo "$(_fdbinpath)" configure init all --config "$(_fdconfig)"; }
-function finifd()    { _fd_dispatch "$1" sudo "$(_fdbinpath)" configure fini all --config "$(_fdconfig)"; }
+function initfd() {
+    local bin
+    bin=$(_fdbinpath) || return
+    _fd_dispatch "$1" sudo "$bin" configure init all --config "$(_fdconfig)"
+}
+function finifd() {
+    local bin
+    bin=$(_fdbinpath) || return
+    _fd_dispatch "$1" sudo "$bin" configure fini all --config "$(_fdconfig)"
+}
 
 # ── Firedancer Fork Sync ──────────────────────────────
 # updatefd: sync local + origin main to upstream's main. Only ever touches

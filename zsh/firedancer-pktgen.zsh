@@ -29,8 +29,10 @@ _pktfd_setif() {
 function pktfd() {
     if [ "$1" = setup ];   then shift; _pktfd_setup "$@";   return; fi
     if [ "$1" = restore ]; then shift; _pktfd_restore "$@"; return; fi
-    if [ "$1" = gdb ];     then shift; sudo gdb -q --args "$(_fdbinpath)" pktgen --config "$(_fdconfig)" "$@"; return; fi
-    _fd_dispatch "$1" sudo "$(_fdbinpath)" pktgen --config "$(_fdconfig)"
+    local bin
+    bin=$(_fdbinpath) || return
+    if [ "$1" = gdb ];     then shift; sudo gdb -q --args "$bin" pktgen --config "$(_fdconfig)" "$@"; return; fi
+    _fd_dispatch "$1" sudo "$bin" pktgen --config "$(_fdconfig)"
 }
 
 # ── Shared DPDK/NIC Helpers (pktfd + floodfd) ────────
