@@ -83,7 +83,7 @@ function switchfd() {
 # These were aliases historically; drop any stale alias so re-sourcing .zshrc
 # (without a fresh shell) doesn't shadow the functions — an alias would make
 # `pktfd setup` expand to `... pktgen ... setup` instead of running the setup.
-unalias makefd updatefd pktfd devfd testnetfd flamefd metricsfd memfd initfd finifd 2>/dev/null
+unalias makefd updatefd pktfd benchfd devfd testnetfd flamefd metricsfd memfd initfd finifd 2>/dev/null
 
 # Every function below takes an optional `cmd` first argument (see
 # _fd_dispatch): plain `devfd` runs the validator, `devfd cmd` just shows +
@@ -94,6 +94,12 @@ function devfd() {
     bin=$(_fdbinpath) || return
     if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$bin" dev --config "$(_fdconfig)" "$@"; return; fi
     _fd_dispatch "$1" sudo "$bin" dev --config "$(_fdconfig)"
+}
+function benchfd() {
+    local bin
+    bin=$(_fdbinpath) || return
+    if [ "$1" = gdb ]; then shift; sudo gdb -q --args "$bin" bench --config "$(_fdconfig)" "$@"; return; fi
+    _fd_dispatch "$1" sudo "$bin" bench --config "$(_fdconfig)"
 }
 function testnetfd() {
     local bin
