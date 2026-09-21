@@ -158,9 +158,30 @@ require("lazy").setup({
   { "windwp/nvim-autopairs", opts = {} },
 
   -- LSP & Auto-Completion
-  { "williamboman/mason.nvim", opts = {} },
+  {
+    "williamboman/mason.nvim",
+    opts = {},
+    config = function(_, opts)
+      require("mason").setup(opts)
+      -- Interrupted installs can leave broken links that block Mason's next install.
+      local uv = vim.uv or vim.loop
+      local root = require("mason.settings").current.install_root_dir
+      for _, name in ipairs({ "clangd", "pyright", "lua-language-server" }) do
+        local path = root .. "/bin/" .. name
+        local target = uv.fs_readlink(path)
+        local _, _, err = uv.fs_stat(path)
+        if target and target:match("^%.%./packages/") and err == "ENOENT" then
+          local ok, unlink_err = uv.fs_unlink(path)
+          if not ok then
+            vim.notify("Mason: cannot remove broken link " .. path .. ": " .. unlink_err, vim.log.levels.WARN)
+          end
+        end
+      end
+    end,
+  },
   {
     "williamboman/mason-lspconfig.nvim",
+    dependencies = { "williamboman/mason.nvim" },
     config = function()
       local servers = { "clangd", "pyright", "lua_ls" }
       require("mason-lspconfig").setup({
