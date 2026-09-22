@@ -14,6 +14,7 @@
 | `pktfd setup` | Configure firedancer NIC route/ARP + optional DPDK pktgen; prompts for NICs as needed. |
 | `pktfd restore` | Undo `setup`'s vfio-pci bind — return the pktgen NIC to its kernel driver. |
 | `flamefd` | Capture a `perf` flamegraph. |
+| `monitorfd [options]` | Show live tile/link statistics with the active config. `monitorfd cmd` prints and copies the command. |
 | `metricsfd` | Print Prometheus metrics. |
 | `memfd` | Print the binary's memory usage report, paged with `less`. |
 | `initfd` | `configure init all` with active config. |
