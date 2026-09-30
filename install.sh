@@ -140,6 +140,26 @@ create_symlink "$DOTFILES_DIR/zsh/.bashrc"        "$HOME/.bashrc"
 create_symlink "$DOTFILES_DIR/zsh/.bash_profile"  "$HOME/.bash_profile"
 create_symlink "$DOTFILES_DIR/tmux/.tmux.conf" "$HOME/.tmux.conf"
 
+# sh reads .profile on interactive SSH logins.
+profile_file="$HOME/.profile"
+if [ ! -L "$profile_file" ] && ! grep -Fqx '# dotfiles zsh begin' "$profile_file" 2>/dev/null; then
+    profile_tmp="$(mktemp "$HOME/.profile.XXXXXX")" || exit 1
+    if [ -e "$profile_file" ]; then
+        cp -p "$profile_file" "$profile_tmp" || { rm -f "$profile_tmp"; exit 1; }
+    fi
+    cat >> "$profile_tmp" <<'PROFILE' || { rm -f "$profile_tmp"; exit 1; }
+
+# dotfiles zsh begin
+case $- in
+    *i*) if [ -t 0 ] && command -v zsh >/dev/null 2>&1; then
+        exec zsh -l
+    fi ;;
+esac
+# dotfiles zsh end
+PROFILE
+    mv "$profile_tmp" "$profile_file" || { rm -f "$profile_tmp"; exit 1; }
+fi
+
 if [ -d "$HOME/.config/nvim" ] && [ ! -L "$HOME/.config/nvim" ]; then
     echo "[Backup] Moving existing Neovim config..."
     mv "$HOME/.config/nvim" "$HOME/.config/nvim.backup.$(date +%s)"

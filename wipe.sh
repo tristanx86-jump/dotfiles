@@ -91,6 +91,26 @@ for f in "$HOME/.zshrc" "$HOME/.p10k.zsh" "$HOME/.bashrc" "$HOME/.bash_profile" 
     _unlink_if_ours "$f"
 done
 
+profile_file="$HOME/.profile"
+if [ -f "$profile_file" ] && [ ! -L "$profile_file" ] &&
+   grep -Fqx '# dotfiles zsh begin' "$profile_file"; then
+    profile_tmp="$(mktemp "$HOME/.profile.XXXXXX")" || exit 1
+    cp -p "$profile_file" "$profile_tmp" || { rm -f "$profile_tmp"; exit 1; }
+    if awk '
+        $0 == "# dotfiles zsh begin" { skip=1; next }
+        $0 == "# dotfiles zsh end" && skip { skip=0; next }
+        !skip { print }
+        END { if (skip) exit 1 }
+    ' "$profile_file" > "$profile_tmp"; then
+        mv "$profile_tmp" "$profile_file" || { rm -f "$profile_tmp"; exit 1; }
+        echo "[Shell] Removed Zsh startup from $profile_file"
+    else
+        rm -f "$profile_tmp"
+        echo "[ERROR] Incomplete dotfiles block in $profile_file" >&2
+        exit 1
+    fi
+fi
+
 FD_LINK_STATE="$STATE_DIR/firedancer-bin-links"
 if [ -f "$FD_LINK_STATE" ]; then
     echo "==== Removing installer-managed Firedancer links ===="
