@@ -176,6 +176,7 @@ if [ ! -x "$HOME/.local/bin/nvim" ]; then
         *) echo "[ERROR] Unsupported Neovim architecture" >&2; return 1 ;;
     esac
     nvim_dir="$HOME/.local/share/dotfiles/nvim"
+    mkdir -p "$HOME/.local/bin" "$(dirname "$nvim_dir")" || return 1
     if [ ! -x "$nvim_dir/bin/nvim" ]; then
         if [ -e "$nvim_dir" ]; then
             echo "[ERROR] Incomplete Neovim directory at $nvim_dir" >&2
