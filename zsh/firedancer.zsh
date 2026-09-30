@@ -6,27 +6,27 @@
 # stored per-device in an untracked file (defaults to firedancer-dev).
 FD_BIN_FILE="$HOME/.config/dotfiles/fdbin"
 _fdbin() { cat "$FD_BIN_FILE" 2>/dev/null || echo firedancer-dev; }
-# _fdbinpath prefers Make's build link, then current and older build layouts.
+# _fdbinpath uses the selected Clang build link, then current and older Clang layouts.
 # Return an absolute path so sudo does not need the binary on PATH.
 _fdbinpath() {
-    local name objdir bin
+    local name objdir bin clang_bin=""
     local -a candidates
     name=$(_fdbin) || return
+    objdir=$(make -s --no-print-directory CC=clang objdir 2>/dev/null)
+    if [[ -n "$objdir" ]]; then
+        clang_bin="$objdir/bin/$name"
+        clang_bin="${clang_bin:A}"
+    fi
     bin="$PWD/build/$name"
-    if [[ -f "$bin" && -x "$bin" ]]; then
+    if [[ -n "$clang_bin" && -f "$bin" && -x "$bin" && "${bin:A}" == "$clang_bin" ]]; then
         print -r -- "$bin"
         return
     fi
-    objdir=$(make -s --no-print-directory objdir 2>/dev/null)
-    if [[ -n "$objdir" ]]; then
-        bin="$objdir/bin/$name"
-        bin="${bin:a}"
-        if [[ -f "$bin" && -x "$bin" ]]; then
-            print -r -- "$bin"
-            return
-        fi
+    if [[ -n "$clang_bin" && -f "$clang_bin" && -x "$clang_bin" ]]; then
+        print -r -- "$clang_bin"
+        return
     fi
-    candidates=(build/*/*/bin/$name(N.Om))
+    candidates=(build/*/clang/bin/$name(N.Om))
     for bin in "${candidates[@]}"; do
         if [[ -f "$bin" && -x "$bin" ]]; then
             print -r -- "${bin:a}"
@@ -101,7 +101,7 @@ unalias makefd updatefd pktfd benchfd devfd testnetfd flamefd monitorfd metricsf
 # Every function below takes an optional `cmd` first argument (see
 # _fd_dispatch): plain `devfd` runs the validator, `devfd cmd` just shows +
 # copies the command it would have run.
-function makefd()    { make -j"${MAKE_JOBS:-8}" $(_fdtarget); }
+function makefd()    { make -j CC=clang $(_fdtarget); }
 function devfd() {
     local bin
     bin=$(_fdbinpath) || return
