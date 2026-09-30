@@ -8,31 +8,27 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 DOTFILES_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 OS="$(uname -s)"
+[ "$OS" = Linux ] || {
+    echo "[ERROR] The full installer supports Linux. Use install-client.sh on macOS." >&2
+    exit 1
+}
 FONT_DIR="$HOME/.local/share/fonts"
-source "$DOTFILES_DIR/install-packages.sh"
-
-# Detect distro family by available package manager (used below, and to know
-# which package list to check when snapshotting original machine state).
-DISTRO_FAMILY="" RHEL_PKG=""
-if [[ "$OS" == "Linux" ]]; then
-    if command -v apt-get &>/dev/null; then
-        DISTRO_FAMILY="debian"
-    elif command -v dnf &>/dev/null; then
-        DISTRO_FAMILY="rhel"; RHEL_PKG="dnf"
-    elif command -v yum &>/dev/null; then
-        DISTRO_FAMILY="rhel"; RHEL_PKG="yum"
-    else
-        DISTRO_FAMILY="unknown"
-    fi
-fi
 
 # Where we cache cheap "did this already happen recently" markers so re-runs
 # (updatedot) don't redo expensive network-bound work every single time.
 STATE_DIR="$HOME/.cache/dotfiles"
 mkdir -p "$STATE_DIR"
 
-# Prefer user-owned tools installed by this script over incompatible system copies.
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+_old_tools_path="$HOME/.local/share/dotfiles/tools/bin"
+while [[ ":$PATH:" == *":$_old_tools_path:"* ]]; do
+    PATH=":$PATH:"
+    PATH="${PATH/:$_old_tools_path:/:}"
+    PATH="${PATH#:}"
+    PATH="${PATH%:}"
+done
+unset _old_tools_path
+# Keep user-local editor and plugin commands on PATH.
+export PATH="$HOME/.local/bin:$PATH"
 
 # -----------------------------------------------------------------------------
 # Original-state snapshot (for `wipedot`)
@@ -48,64 +44,16 @@ if [ ! -f "$ORIGINAL_STATE_FILE" ]; then
     echo "[Wipedot] First run on this machine — recording original state for wipedot..."
     {
         echo "ORIGINAL_OS=$OS"
-        echo "ORIGINAL_DISTRO_FAMILY=$DISTRO_FAMILY"
         echo "ORIGINAL_SHELL=$SHELL"
+        echo "SNAPSHOT_VERSION=4"
+        echo "MANAGED_SYSTEM_PACKAGES=0"
+        echo "MANAGED_LOGIN_SHELL=0"
+        echo "MANAGED_OHMYZSH=0"
 
-        preexisting=()
-        case "$DISTRO_FAMILY" in
-            debian)
-                for pkg in "${DEBIAN_PKGS[@]+"${DEBIAN_PKGS[@]}"}" "${DEBIAN_PERF_PKGS[@]+"${DEBIAN_PERF_PKGS[@]}"}" "${DEBIAN_NEOVIM_PKGS[@]+"${DEBIAN_NEOVIM_PKGS[@]}"}"; do
-                    dpkg -s "$pkg" >/dev/null 2>&1 && preexisting+=("$pkg")
-                done
-                ;;
-            rhel)
-                for pkg in "${RHEL_PKGS[@]+"${RHEL_PKGS[@]}"}" "${RHEL_EXTRA_PKGS[@]+"${RHEL_EXTRA_PKGS[@]}"}" "${RHEL_PERF_PKGS[@]+"${RHEL_PERF_PKGS[@]}"}" "${RHEL_NEOVIM_PKGS[@]+"${RHEL_NEOVIM_PKGS[@]}"}"; do
-                    rpm -q "$pkg" >/dev/null 2>&1 && preexisting+=("$pkg")
-                done
-                ;;
-        esac
-        if [[ "$OS" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-            for pkg in "${BREW_FORMULAE[@]+"${BREW_FORMULAE[@]}"}"; do
-                brew list --formula "$pkg" >/dev/null 2>&1 && preexisting+=("$pkg")
-            done
-            for pkg in "${BREW_CASKS[@]+"${BREW_CASKS[@]}"}" "${BREW_CASKS_SOFT[@]+"${BREW_CASKS_SOFT[@]}"}"; do
-                brew list --cask "$pkg" >/dev/null 2>&1 && preexisting+=("$pkg")
-            done
-        fi
-        echo "PREEXISTING_PKGS=\"${preexisting[*]}\""
-
-        # None of these are apt/dnf/brew packages, so they need their own
-        # presence check — install.sh only ever acts on each when it's
-        # *absent* (every _task_* below is a "return 0 if already there"
-        # guard), so "was it here before" is the only fact wipedot needs; it
-        # never has to worry about dotfiles having upgraded/modified one that
-        # already existed.
+        # Record user-local tools that may predate this install for wipedot.
         _p() { [ -e "$1" ] && echo 1 || echo 0; }
-        echo "PREEXISTING_OHMYZSH=$(_p "$HOME/.oh-my-zsh")"
-        echo "PREEXISTING_CARGO=$(command -v cargo >/dev/null 2>&1 && echo 1 || echo 0)"
-        echo "PREEXISTING_KITTY=$(command -v kitty >/dev/null 2>&1 && echo 1 || echo 0)"
         echo "PREEXISTING_FONT=$(_p "$FONT_DIR/FiraCode")"
-        echo "PREEXISTING_TREESITTER_CLI=$(command -v tree-sitter >/dev/null 2>&1 && echo 1 || echo 0)"
-        echo "PREEXISTING_TPM=$(_p "$HOME/.tmux/plugins/tpm")"
-        echo "PREEXISTING_P10K=$(_p "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k")"
         echo "PREEXISTING_NVIM_DATA=$(_p "${XDG_DATA_HOME:-$HOME/.local/share}/nvim")"
-
-        if [[ "$OS" == "Darwin" ]]; then
-            iterm_guid_val="$(defaults read com.googlecode.iterm2 "Default Bookmark Guid" 2>/dev/null)"
-            if [ -n "$iterm_guid_val" ]; then
-                echo "ITERM_GUID_WAS_SET=1"
-                echo "ORIGINAL_ITERM_GUID=\"$iterm_guid_val\""
-            else
-                echo "ITERM_GUID_WAS_SET=0"
-            fi
-            iterm_clip_val="$(defaults read com.googlecode.iterm2 AllowClipboardAccess 2>/dev/null)"
-            if [ -n "$iterm_clip_val" ]; then
-                echo "ITERM_CLIP_WAS_SET=1"
-                echo "ORIGINAL_ITERM_CLIP=\"$iterm_clip_val\""
-            else
-                echo "ITERM_CLIP_WAS_SET=0"
-            fi
-        fi
     } > "$ORIGINAL_STATE_FILE"
 fi
 
@@ -120,317 +68,49 @@ _sha256() {
     fi
 }
 
-# _apt_update_if_stale <max_age_hours>: `apt-get update` hits every configured
-# mirror over the network, so only do it if the lists are actually old enough
-# to matter — updatedot re-running this daily shouldn't re-fetch them every time.
-_apt_update_if_stale() {
-    local max_age_hours=$1 stamp="$STATE_DIR/apt-update-stamp"
-    if [ -f "$stamp" ]; then
-        local age_h=$(( ($(date +%s) - $(stat -c %Y "$stamp")) / 3600 ))
-        if [ "$age_h" -lt "$max_age_hours" ]; then
-            echo "  (package lists refreshed ${age_h}h ago, < ${max_age_hours}h — skipping apt-get update)"
-            return 0
-        fi
-    fi
-    sudo apt-get update -y && touch "$stamp"
-}
-
-# _bg_run <name> <func>: run <func> (no args) in the background, capturing its
-# output to a per-job log, so independent installs with no shared state
-# (network fetches, git clones) can happen concurrently instead of one at a
-# time. Never use this for anything touching apt/dnf/yum — package managers
-# take an exclusive lock, so "parallel" calls there just serialize anyway
-# while adding a new way to fail.
-BG_PIDS=() BG_NAMES=() BG_LOGS=()
-_bg_run() {
-    local name=$1 log="$STATE_DIR/bg-$1.log"
-    # stdin -> /dev/null: these should all be non-interactive (-y/--unattended),
-    # so if one unexpectedly wants input it fails fast instead of hanging
-    # silently in the background on the terminal's stdin.
-    ( "$1" ) </dev/null >"$log" 2>&1 &
-    BG_PIDS+=("$!"); BG_NAMES+=("$name"); BG_LOGS+=("$log")
-}
-
-# _bg_wait: wait for every _bg_run job queued so far, printing its captured
-# output and flagging failures, then reset the queue.
-_bg_wait() {
-    local i pid name log rc
-    for i in "${!BG_PIDS[@]}"; do
-        pid=${BG_PIDS[$i]}; name=${BG_NAMES[$i]}; log=${BG_LOGS[$i]}
-        wait "$pid"; rc=$?
-        [ -s "$log" ] && cat "$log"
-        [ "$rc" -ne 0 ] && echo "[WARNING] $name failed (exit $rc) — see above."
-    done
-    BG_PIDS=() BG_NAMES=() BG_LOGS=()
-}
-
 echo "==== Initializing Environment Setup ===="
 
-# Ask for the administrator password upfront and keep it alive
-if [[ "$OS" == "Linux" ]]; then
-    sudo -v
-    while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+# Confirm missing packages, existing-package updates, and the optional font.
+if ! source "$DOTFILES_DIR/install-user-tools.sh"; then
+    echo "[ERROR] System tool installation failed." >&2
+    exit 1
 fi
 
-# -----------------------------------------------------------------------------
-# MacOS Setup
-# -----------------------------------------------------------------------------
-if [[ "$OS" == "Darwin" ]]; then
-    echo "[MacOS] Detected. Checking Homebrew..."
-    if ! command -v brew &>/dev/null; then
-        echo "[MacOS] Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        # Homebrew lives at /opt/homebrew on Apple Silicon, /usr/local on Intel.
-        for _brewbin in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-            [ -x "$_brewbin" ] && eval "$("$_brewbin" shellenv)" && break
-        done
-    fi
-
-    echo "[MacOS] Installing Core Utilities & Dev Tools..."
-    brew install "${BREW_FORMULAE[@]}"
-    brew install --cask "${BREW_CASKS[@]}"
-    brew install --cask "${BREW_CASKS_SOFT[@]}" 2>/dev/null || true
-
-    # iTerm2: install TokyoNight Dynamic Profile + configure preferences so nothing
-    # needs to be done manually inside the app.
-    ITERM_DIR="$HOME/Library/Application Support/iTerm2"
-    if [ -d "$ITERM_DIR" ]; then
-        mkdir -p "$ITERM_DIR/DynamicProfiles"
-        cp "$DOTFILES_DIR/iterm2/TokyoNight.json" "$ITERM_DIR/DynamicProfiles/"
-        # Set TokyoNight as the default profile (GUID matches the JSON file).
-        defaults write com.googlecode.iterm2 "Default Bookmark Guid" \
-            -string "fd0c77e8-7bb3-4b8c-9d2f-1a2b3c4d5e6f"
-        # Allow OSC 52 clipboard access so copy/paste works over SSH.
-        defaults write com.googlecode.iterm2 AllowClipboardAccess -bool true
-        echo "[MacOS] iTerm2 configured (TokyoNight profile set as default, clipboard enabled)."
-        echo "        Restart iTerm2 for preference changes to take effect."
-    fi
-
-# -----------------------------------------------------------------------------
-# Linux Setup
-# -----------------------------------------------------------------------------
-elif [[ "$OS" == "Linux" ]]; then
-    [[ "$DISTRO_FAMILY" == "unknown" ]] && \
-        echo "[WARNING] No supported package manager found (apt-get/dnf/yum). Skipping system packages."
-
-    # ---- Debian / Ubuntu -----------------------------------------------------
-    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        echo "[Linux/Debian] Updating package lists..."
-        _apt_update_if_stale 24
-
-        echo "[Linux/Debian] Installing System & Dev Dependencies..."
-        sudo apt-get install -y "${DEBIAN_PKGS[@]}"
-
-        # Performance / measurement tooling (perf_cmds.md)
-        echo "[Linux/Debian] Installing performance / measurement tooling..."
-        sudo apt-get install -y "${DEBIAN_PERF_PKGS[@]}" \
-            || echo "[WARNING] some perf tools unavailable; install manually (see perf_cmds.md)."
-
-        # Install Neovim from unstable PPA — only add + refresh the repo the
-        # first time; once it's there, apt's normal cache (see
-        # _apt_update_if_stale above) keeps it fresh without a forced update.
-        if ! grep -rq "neovim-ppa/unstable" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-            echo "[Linux/Debian] Adding Neovim Unstable PPA..."
-            sudo add-apt-repository -y ppa:neovim-ppa/unstable
-            sudo apt-get update -y
-        fi
-        echo "[Linux/Debian] Installing/Upgrading Neovim..."
-        sudo apt-get install -y "${DEBIAN_NEOVIM_PKGS[@]}"
-
-        # Kernel-version-specific perf tools (graceful failure for non-matching kernels)
-        sudo apt-get install -y linux-tools-$(uname -r) || \
-            echo "[WARNING] Could not install linux-tools-$(uname -r); perf may still work via linux-tools-generic."
-
-        # Debian/Ubuntu installs fd as 'fdfind'; Neovim telescope expects 'fd'
-        if ! command -v fd &>/dev/null && command -v fdfind &>/dev/null; then
-            sudo ln -sf "$(which fdfind)" /usr/local/bin/fd
-        fi
-
-    # ---- Red Hat / Fedora / Rocky Linux / AlmaLinux / CentOS ----------------
-    elif [[ "$DISTRO_FAMILY" == "rhel" ]]; then
-        echo "[Linux/RHEL] Detected ${RHEL_PKG}-based system."
-
-        # Enable EPEL on non-Fedora systems (provides zoxide, btop, bpftrace, bcc-tools, etc.)
-        DISTRO_ID="$(. /etc/os-release 2>/dev/null && echo "${ID:-}")"
-        if [[ "$DISTRO_ID" != "fedora" ]]; then
-            echo "[Linux/RHEL] Enabling EPEL repository..."
-            sudo "$RHEL_PKG" install -y epel-release \
-                || echo "[WARNING] epel-release unavailable; some packages may be missing."
-        fi
-
-        echo "[Linux/RHEL] Installing System & Dev Dependencies..."
-        # Key name differences vs Debian: gcc gcc-c++ make (≈build-essential),
-        # pkgconf-pkg-config (≈pkg-config), openssl-devel (≈libssl-dev),
-        # python3 python3-pip (≈python3-venv — venv is bundled in python3 on RHEL)
-        sudo "$RHEL_PKG" install -y "${RHEL_PKGS[@]}"
-        # kitty-terminfo is in Fedora repos and EPEL; soft-install so SSH sessions
-        # with TERM=xterm-kitty are recognised (clipboard, true colour, etc.).
-        sudo "$RHEL_PKG" install -y "${RHEL_EXTRA_PKGS[@]}" 2>/dev/null \
-            || echo "[INFO] kitty-terminfo not available; TERM=xterm-kitty may not be recognised."
-
-        # Performance / measurement tooling
-        # Key name differences: perf (≈linux-tools-*), bcc-tools (≈bpfcc-tools)
-        echo "[Linux/RHEL] Installing performance / measurement tooling..."
-        sudo "$RHEL_PKG" install -y "${RHEL_PERF_PKGS[@]}" \
-            || echo "[WARNING] some perf tools unavailable; install manually (see perf_cmds.md)."
-
-        # Install Neovim; fall back to pre-built binary from GitHub if not in repos
-        echo "[Linux/RHEL] Installing Neovim..."
-        if ! sudo "$RHEL_PKG" install -y "${RHEL_NEOVIM_PKGS[@]}" 2>/dev/null; then
-            echo "[Linux/RHEL] Falling back to pre-built Neovim binary from GitHub..."
-            NVIM_ARCHIVE="/tmp/nvim-linux-x86_64.tar.gz"
-            curl -L https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz \
-                -o "$NVIM_ARCHIVE" \
-                && sudo tar -C /usr/local -xzf "$NVIM_ARCHIVE" --strip-components=1 \
-                && rm -f "$NVIM_ARCHIVE" \
-                || echo "[WARNING] Neovim install failed; install manually."
-        fi
-
-        # On RHEL/Fedora, fd-find installs the binary as 'fd' (no symlink needed)
-        if ! command -v fd &>/dev/null; then
-            sudo "$RHEL_PKG" install -y fd-find 2>/dev/null \
-                || echo "[WARNING] fd not installed; Neovim file picker may not work."
-        fi
-    fi
-
-    # ---- Shared Linux (distro-agnostic) --------------------------------------
-    # Independent network installs, no shared state between them — run
-    # concurrently instead of one after another.
-    _task_rust() {
-        command -v cargo &>/dev/null && return 0
-        echo "[Linux] Installing Rust..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    }
-    _task_kitty() {
-        command -v kitty &>/dev/null && return 0
-        echo "[Linux] Installing Kitty Terminal..."
-        curl -fsSL https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin
-        mkdir -p ~/.local/bin
-        ln -sf ~/.local/kitty.app/bin/kitty ~/.local/bin/kitty
-    }
-    _task_nerdfont() {
-        # Guard on real font files, not just the directory: a failed download
-        # used to leave an empty dir that blocked every future retry.
-        compgen -G "$FONT_DIR/FiraCode/*.ttf" >/dev/null 2>&1 && return 0
-        echo "[Linux] Installing FiraCode Nerd Font..."
-        mkdir -p "$FONT_DIR/FiraCode"
-        if ! wget -q -P "$FONT_DIR/FiraCode" \
-            https://github.com/ryanoasis/nerd-fonts/releases/latest/download/FiraCode.zip; then
-            echo "[WARNING] FiraCode download failed; will retry on next run."
-            rm -f "$FONT_DIR/FiraCode/FiraCode.zip"
+FD_LINK_STATE="$STATE_DIR/firedancer-bin-links"
+link_firedancer_binary() {
+    local dest=$1 name=$2 target
+    target="$HOME/firedancer/build/$name"
+    if [ -L "$dest" ]; then
+        if [ "$(readlink "$dest")" = "$target" ]; then
             return 0
         fi
-        unzip -q "$FONT_DIR/FiraCode/FiraCode.zip" -d "$FONT_DIR/FiraCode"
-        rm -f "$FONT_DIR/FiraCode/FiraCode.zip"
-        fc-cache -f
-    }
-    _bg_run _task_rust
-    _bg_run _task_kitty
-    _bg_run _task_nerdfont
-    _bg_wait
-fi
-
-# -----------------------------------------------------------------------------
-# tree-sitter CLI, Oh-My-Zsh, Powerlevel10k, TPM
-# -----------------------------------------------------------------------------
-# Four independent installs, none depending on each other, run concurrently.
-# Build tree-sitter-cli from source when possible so it uses the host's libc.
-_treesitter_cli_works() {
-    command -v tree-sitter >/dev/null 2>&1 && tree-sitter --version >/dev/null 2>&1
-}
-_task_treesitter_cli() {
-    _treesitter_cli_works && return 0
-    echo "[Neovim] Installing tree-sitter CLI..."
-    if command -v cargo >/dev/null 2>&1; then
-        cargo install tree-sitter-cli --locked --root "$HOME/.local" || return 1
-    elif command -v npm >/dev/null 2>&1; then
-        npm install -g --prefix "$HOME/.local" tree-sitter-cli || return 1
-    else
-        echo "[WARNING] tree-sitter CLI needs cargo or npm."
-        return 1
+    elif [ -e "$dest" ]; then
+        echo "[Skip] $dest is a real file."
+        return 0
     fi
-    hash -r
-    _treesitter_cli_works || {
-        echo "[WARNING] installed tree-sitter CLI cannot run on this host."
-        return 1
-    }
-}
-_task_ohmyzsh() {
-    # Guard on the framework loader, not just the directory: a gutted install
-    # (only custom/ surviving, e.g. an interrupted update) leaves ~/.oh-my-zsh
-    # present but oh-my-zsh.sh missing, so .zshrc's `[ -f $ZSH/oh-my-zsh.sh ]`
-    # guard silently skips OMZ entirely — no theme, no plugins, bare prompt.
-    # A plain `[ -d ~/.oh-my-zsh ]` check would call that "installed" forever.
-    [ -f "$HOME/.oh-my-zsh/oh-my-zsh.sh" ] && return 0
-
-    # Self-heal a gutted/partial install: the upstream installer refuses a
-    # non-empty ~/.oh-my-zsh, so move it aside first, preserving custom/
-    # (holds the p10k theme) to restore after the fresh clone.
-    local saved_custom=""
-    if [ -d "$HOME/.oh-my-zsh" ]; then
-        echo "[Shell] ~/.oh-my-zsh present but oh-my-zsh.sh missing — repairing..."
-        if [ -d "$HOME/.oh-my-zsh/custom" ]; then
-            saved_custom="$(mktemp -d)/custom"
-            cp -a "$HOME/.oh-my-zsh/custom" "$saved_custom"
-        fi
-        rm -rf "$HOME/.oh-my-zsh.broken"
-        mv "$HOME/.oh-my-zsh" "$HOME/.oh-my-zsh.broken"
+    sudo ln -sfnT -- "$target" "$dest" || return 1
+    if ! grep -Fqx "$dest" "$FD_LINK_STATE" 2>/dev/null; then
+        printf '%s\n' "$dest" >> "$FD_LINK_STATE" || return 1
     fi
+    echo "[Link] $dest -> $target"
+}
 
-    echo "[Shell] Installing Oh-My-Zsh..."
-    # RUNZSH/CHSH/KEEP_ZSHRC: don't drop into zsh, don't touch the login shell
-    # or .zshrc — install.sh manages those itself further down.
-    RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
-        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-
-    # Restore the preserved custom/ (p10k theme etc.) over the fresh empty one.
-    if [ -n "$saved_custom" ] && [ -d "$saved_custom" ]; then
-        cp -a "$saved_custom/." "$HOME/.oh-my-zsh/custom/"
-        rm -rf "$(dirname "$saved_custom")"
+for fd_name in firedancer-dev fddev fdctl solana; do
+    link_firedancer_binary "/usr/bin/$fd_name" "$fd_name" || exit 1
+    local_link="/usr/local/bin/$fd_name"
+    if [ -L "$local_link" ]; then
+        case "$(readlink "$local_link")" in
+            */firedancer/build/*)
+                link_firedancer_binary "$local_link" "$fd_name" || exit 1
+                ;;
+        esac
     fi
-}
-_task_p10k() {
-    local dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
-    [ -d "$dir" ] && return 0
-    echo "[Shell] Installing Powerlevel10k Theme..."
-    git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$dir"
-}
-_task_tpm() {
-    local dir="$HOME/.tmux/plugins/tpm"
-    [ -d "$dir" ] && return 0
-    echo "[Tmux] Installing TPM (Tmux Plugin Manager)..."
-    git clone --depth=1 https://github.com/tmux-plugins/tpm "$dir"
-}
-_bg_run _task_treesitter_cli
-_bg_run _task_ohmyzsh
-_bg_run _task_tpm
-_bg_wait
-
-# p10k's target lives *inside* oh-my-zsh's directory tree (custom/themes/...),
-# so it isn't actually independent of _task_ohmyzsh — it has to run after that
-# batch completes, not alongside it (a concurrent clone could leave
-# ~/.oh-my-zsh non-empty right as oh-my-zsh's own clone tries to populate it).
-_task_p10k
+done
 
 # -----------------------------------------------------------------------------
 # Shell Configuration & Symlinking
 # -----------------------------------------------------------------------------
 
-# Set zsh as the login shell.
-# chsh may fail on LDAP/managed accounts; we fall back to an exec zsh line in
-# .bashrc so interactive sessions still land in zsh regardless.
-ZSH_BIN="$(command -v zsh 2>/dev/null)"
-if [ -n "$ZSH_BIN" ]; then
-    # zsh must be in /etc/shells before chsh will accept it.
-    if ! grep -qx "$ZSH_BIN" /etc/shells 2>/dev/null; then
-        echo "$ZSH_BIN" | sudo tee -a /etc/shells >/dev/null
-    fi
-    if chsh -s "$ZSH_BIN" "$USER" 2>/dev/null || sudo chsh -s "$ZSH_BIN" "$USER" 2>/dev/null; then
-        echo "[Shell] Login shell set to $ZSH_BIN."
-    else
-        echo "[Shell] chsh failed (managed account?). .bashrc will exec zsh as fallback."
-    fi
-fi
 
 create_symlink() {
     local src=$1
@@ -456,11 +136,9 @@ create_symlink() {
 
 echo "==== Linking Configuration Files ===="
 create_symlink "$DOTFILES_DIR/zsh/.zshrc"        "$HOME/.zshrc"
-create_symlink "$DOTFILES_DIR/zsh/.p10k.zsh"     "$HOME/.p10k.zsh"
 create_symlink "$DOTFILES_DIR/zsh/.bashrc"        "$HOME/.bashrc"
 create_symlink "$DOTFILES_DIR/zsh/.bash_profile"  "$HOME/.bash_profile"
 create_symlink "$DOTFILES_DIR/tmux/.tmux.conf" "$HOME/.tmux.conf"
-create_symlink "$DOTFILES_DIR/kitty/kitty.conf" "$HOME/.config/kitty/kitty.conf"
 
 if [ -d "$HOME/.config/nvim" ] && [ ! -L "$HOME/.config/nvim" ]; then
     echo "[Backup] Moving existing Neovim config..."
@@ -468,23 +146,11 @@ if [ -d "$HOME/.config/nvim" ] && [ ! -L "$HOME/.config/nvim" ]; then
 fi
 create_symlink "$DOTFILES_DIR/nvim" "$HOME/.config/nvim"
 
-# Install tmux plugins now that .tmux.conf is linked.
-if [ -x "$HOME/.tmux/plugins/tpm/bin/install_plugins" ]; then
-    echo "[Tmux] Installing tmux plugins..."
-    "$HOME/.tmux/plugins/tpm/bin/install_plugins" || echo "[WARNING] tmux plugin install failed; run prefix+I inside tmux."
-fi
-
-# Sync Neovim plugins to the lockfile and build treesitter parsers, so updatedot
-# is self-contained (restore switches nvim-treesitter to its `main` branch).
-# Both steps are skipped when there's nothing to do — a headless nvim start
-# plus a plugin sync isn't free, and updatedot may run this daily.
+# Sync Neovim plugins to the lockfile when it changes.
 if command -v nvim >/dev/null 2>&1; then
     NVIM_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/nvim"
-    TS_LANGS="c cpp lua rust python bash"
 
-    # A new nvim build can break ABI compatibility with already-compiled
-    # parsers / installed plugins, so an nvim version bump forces a resync
-    # even if the lockfile/parser files themselves look unchanged.
+    # A new nvim build can break installed plugins, so resync after upgrades.
     NVIM_VER_STAMP="$STATE_DIR/nvim-version"
     CUR_NVIM_VER="$(nvim --version | head -1)"
     NVIM_VER_CHANGED=0
@@ -503,18 +169,6 @@ if command -v nvim >/dev/null 2>&1; then
         fi
     else
         echo "[Neovim] Plugins already match the lockfile — skipping Lazy restore."
-    fi
-
-    TS_MISSING=0
-    for lang in $TS_LANGS; do
-        [ -f "$NVIM_DATA_DIR/site/parser/${lang}.so" ] || TS_MISSING=1
-    done
-    if [ "$NVIM_VER_CHANGED" = 1 ] || [ "$TS_MISSING" = 1 ]; then
-        echo "[Neovim] Building treesitter parsers..."
-        nvim --headless "+lua require('nvim-treesitter').install({'c','cpp','lua','rust','python','bash'}):wait(300000)" +qa \
-            || echo "[WARNING] treesitter parser build failed; open nvim and run :TSUpdate."
-    else
-        echo "[Neovim] Treesitter parsers already installed — skipping build."
     fi
 
     echo "$CUR_NVIM_VER" > "$NVIM_VER_STAMP"

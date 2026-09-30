@@ -6,22 +6,35 @@
 # stored per-device in an untracked file (defaults to firedancer-dev).
 FD_BIN_FILE="$HOME/.config/dotfiles/fdbin"
 _fdbin() { cat "$FD_BIN_FILE" 2>/dev/null || echo firedancer-dev; }
-# _fdbinpath uses Make's build directory, matching makefd's current settings.
+# _fdbinpath prefers Make's build link, then current and older build layouts.
 # Return an absolute path so sudo does not need the binary on PATH.
 _fdbinpath() {
     local name objdir bin
+    local -a candidates
     name=$(_fdbin) || return
-    objdir=$(make -s --no-print-directory objdir) || {
-        print -u2 -- "fd: cannot determine the build directory. Run from the Firedancer checkout with makefd's build settings."
-        return 1
-    }
-    bin="$objdir/bin/$name"
-    bin="${bin:a}"
-    if [[ ! -f "$bin" || ! -x "$bin" ]]; then
-        print -u2 -- "fd: executable missing: $bin. Run makefd with the same build settings."
-        return 1
+    bin="$PWD/build/$name"
+    if [[ -f "$bin" && -x "$bin" ]]; then
+        print -r -- "$bin"
+        return
     fi
-    print -r -- "$bin"
+    objdir=$(make -s --no-print-directory objdir 2>/dev/null)
+    if [[ -n "$objdir" ]]; then
+        bin="$objdir/bin/$name"
+        bin="${bin:a}"
+        if [[ -f "$bin" && -x "$bin" ]]; then
+            print -r -- "$bin"
+            return
+        fi
+    fi
+    candidates=(build/*/*/bin/$name(N.Om))
+    for bin in "${candidates[@]}"; do
+        if [[ -f "$bin" && -x "$bin" ]]; then
+            print -r -- "${bin:a}"
+            return
+        fi
+    done
+    print -u2 -- "fd: executable missing for $name. Run makefd from the Firedancer checkout."
+    return 1
 }
 # Make target(s) for the current binary. fddev also needs the solana target.
 _fdtarget() { case "$(_fdbin)" in fddev) echo "fddev solana";; *) echo "$(_fdbin)";; esac; }
@@ -138,6 +151,94 @@ function finifd() {
     local bin
     bin=$(_fdbinpath) || return
     _fd_dispatch "$1" sudo "$bin" configure fini all --config "$(_fdconfig)"
+}
+
+# timenet reports mean and one-second min/max CPU use over 10 seconds.
+function timenet() {
+    if [[ $# -ne 0 ]]; then
+        print -u2 -- "Usage: timenet"
+        return 1
+    fi
+    python3 - <<'PY'
+import os
+import re
+import sys
+import time
+
+
+def fail(message):
+    print(f"timenet: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def tiles():
+    found = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdecimal():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as file:
+                name = file.read().strip()
+        except FileNotFoundError:
+            continue
+        if not re.fullmatch(r"(?:mlx5|net):[0-9]+", name):
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as file:
+                stat = file.read().rsplit(") ", 1)[1].split()
+            with open(f"/proc/{pid}/schedstat") as file:
+                runtime = int(file.read().split()[0])
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            fail(f"cannot read {name} (PID {pid}): {exc}")
+        found[int(pid)] = (name, int(stat[1]), int(stat[19]), runtime)
+    return found
+
+
+start = tiles()
+if not start:
+    fail("no mlx5 or net tile is running")
+if len({tile[0].split(":")[0] for tile in start.values()}) != 1:
+    fail("both mlx5 and net tiles are running")
+if len({tile[1] for tile in start.values()}) != 1:
+    fail("tiles from multiple validators are running")
+if len({tile[0] for tile in start.values()}) != len(start):
+    fail("duplicate tile names are running")
+
+previous = start
+begin_ns = previous_ns = time.monotonic_ns()
+samples = {pid: [] for pid in start}
+total_samples = []
+for _ in range(10):
+    time.sleep(1)
+    current = tiles()
+    current_ns = time.monotonic_ns()
+    if start.keys() != current.keys() or any(start[pid][:3] != current[pid][:3] for pid in start):
+        fail("a tile started, stopped, or restarted during the sample")
+    elapsed_ns = current_ns - previous_ns
+    total_runtime_ns = 0
+    for pid in start:
+        runtime_ns = current[pid][3] - previous[pid][3]
+        if runtime_ns < 0:
+            fail(f"CPU counter decreased for {start[pid][0]}, retry")
+        samples[pid].append(100.0 * runtime_ns / elapsed_ns)
+        total_runtime_ns += runtime_ns
+    total_samples.append(100.0 * total_runtime_ns / elapsed_ns)
+    previous, previous_ns = current, current_ns
+
+elapsed_ns = previous_ns - begin_ns
+mode = next(iter(start.values()))[0].split(":")[0]
+print(f"{mode} CPU over {elapsed_ns / 1e9:.1f}s, percent of one core")
+print("  tile       mean     min     max")
+total_mean = 0.0
+for pid in sorted(start, key=lambda pid: int(start[pid][0].split(":")[1])):
+    name = start[pid][0]
+    mean = 100.0 * (previous[pid][3] - start[pid][3]) / elapsed_ns
+    total_mean += mean
+    print(f"  {name:<8} {mean:6.2f}% {min(samples[pid]):6.2f}% {max(samples[pid]):6.2f}%  (PID {pid})")
+print(f"  {'total':<8} {total_mean:6.2f}% {min(total_samples):6.2f}% {max(total_samples):6.2f}%")
+PY
 }
 
 # ── Firedancer Fork Sync ──────────────────────────────

@@ -91,6 +91,22 @@ for f in "$HOME/.zshrc" "$HOME/.p10k.zsh" "$HOME/.bashrc" "$HOME/.bash_profile" 
     _unlink_if_ours "$f"
 done
 
+FD_LINK_STATE="$STATE_DIR/firedancer-bin-links"
+if [ -f "$FD_LINK_STATE" ]; then
+    echo "==== Removing installer-managed Firedancer links ===="
+    for fd_name in firedancer-dev fddev fdctl solana; do
+        for fd_dir in /usr/bin /usr/local/bin; do
+            fd_link="$fd_dir/$fd_name"
+            fd_target="$HOME/firedancer/build/$fd_name"
+            if grep -Fqx "$fd_link" "$FD_LINK_STATE" &&
+               [ -L "$fd_link" ] && [ "$(readlink "$fd_link")" = "$fd_target" ]; then
+                sudo rm -- "$fd_link" || exit 1
+                echo "[Unlink] $fd_link"
+            fi
+        done
+    done
+fi
+
 echo "==== Removing exclusively-dotfiles state ===="
 rm -rf "$HOME/.config/dotfiles" \
        /tmp/pktfd-bound /tmp/pktfd-setup.pkt /tmp/floodfd-bound /tmp/floodfd-dpdk.pkt
@@ -109,7 +125,7 @@ if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
     echo "[wipedot] No original-state snapshot found — this machine's dotfiles"
     echo "  install predates wipedot (or a snapshot was never recorded), so I"
     echo "  can't tell what existed before dotfiles ran. Leaving in place, untouched:"
-    echo "    Oh-My-Zsh, Powerlevel10k, Rust/cargo, Kitty, Nerd Font, tree-sitter-cli,"
+    echo "    legacy Oh-My-Zsh, Powerlevel10k, Rust/cargo, Kitty, Nerd Font, tree-sitter-cli,"
     echo "    tmux plugins, Neovim plugin data, packages, login shell, iTerm2 prefs."
     read -p "Remove the dotfiles folder itself ($DOTFILES_DIR)? [y/N] " ans
     case "$ans" in
@@ -122,31 +138,47 @@ if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
 fi
 
 echo
-echo "==== Oh-My-Zsh, Rust, Kitty, fonts, tmux plugins, Neovim data ===="
+echo "==== User-local tools, fonts, tmux plugins, Neovim data ===="
 NVIM_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/nvim"
 P10K_DIR="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
 
-if [ "${PREEXISTING_OHMYZSH:-0}" -eq 0 ]; then
-    rm -rf "$HOME/.oh-my-zsh" && echo "[Removed] ~/.oh-my-zsh"
-else
-    echo "[Left in place] ~/.oh-my-zsh (predates dotfiles)"
-    # p10k lives inside oh-my-zsh's tree — if oh-my-zsh itself predates
-    # dotfiles but p10k was added fresh by dotfiles, remove just that subdir.
-    if [ "${PREEXISTING_P10K:-0}" -eq 0 ]; then
-        rm -rf "$P10K_DIR" && echo "[Removed] $P10K_DIR"
+if [ "${MANAGED_OHMYZSH:-1}" -eq 1 ]; then
+    if [ "${PREEXISTING_OHMYZSH:-0}" -eq 0 ]; then
+        rm -rf "$HOME/.oh-my-zsh" && echo "[Removed] legacy ~/.oh-my-zsh"
     else
-        echo "[Left in place] $P10K_DIR (predates dotfiles)"
+        echo "[Left in place] ~/.oh-my-zsh (predates dotfiles)"
+        if [ "${PREEXISTING_P10K:-0}" -eq 0 ]; then
+            rm -rf "$P10K_DIR" && echo "[Removed] $P10K_DIR"
+        else
+            echo "[Left in place] $P10K_DIR (predates dotfiles)"
+        fi
     fi
 fi
 
-if [ "${PREEXISTING_CARGO:-0}" -eq 0 ]; then
-    rm -rf "$HOME/.cargo" "$HOME/.rustup" && echo "[Removed] ~/.cargo ~/.rustup"
-else
-    echo "[Left in place] ~/.cargo ~/.rustup (Rust predates dotfiles)"
+if [ -f "$STATE_DIR/p10k-local-installed" ]; then
+    rm -rf "$HOME/.local/share/powerlevel10k"
+    echo "[Removed] user-local Powerlevel10k"
+fi
+rm -rf "$HOME/.local/share/dotfiles"
+if [ -f "$STATE_DIR/micromamba-installed" ]; then
+    rm -f "$HOME/.local/bin/micromamba"
+fi
+if [ "$(readlink "$HOME/.local/bin/nvim" 2>/dev/null)" = "$HOME/.local/share/dotfiles/nvim/bin/nvim" ]; then
+    rm -f "$HOME/.local/bin/nvim"
 fi
 
-if [ "${PREEXISTING_KITTY:-0}" -eq 0 ]; then
-    rm -rf "$HOME/.local/kitty.app" "$HOME/.local/bin/kitty" && echo "[Removed] Kitty"
+if [ "${SNAPSHOT_VERSION:-1}" -lt 3 ]; then
+    if [ "${PREEXISTING_CARGO:-0}" -eq 0 ]; then
+        rm -rf "$HOME/.cargo" "$HOME/.rustup" && echo "[Removed] ~/.cargo ~/.rustup"
+    else
+        echo "[Left in place] ~/.cargo ~/.rustup (Rust predates dotfiles)"
+    fi
+fi
+
+if [ -f "$STATE_DIR/kitty-local-installed" ] ||
+   { [ "${SNAPSHOT_VERSION:-1}" -eq 1 ] && [ "${PREEXISTING_KITTY:-0}" -eq 0 ]; }; then
+    rm -rf "$HOME/.local/kitty.app" "$HOME/Applications/kitty.app" "$HOME/.local/bin/kitty"
+    echo "[Removed] user-local Kitty"
 else
     echo "[Left in place] Kitty (predates dotfiles)"
 fi
@@ -157,17 +189,24 @@ else
     echo "[Left in place] FiraCode Nerd Font (predates dotfiles)"
 fi
 
-if [ "${PREEXISTING_TREESITTER_CLI:-0}" -eq 0 ] && command -v tree-sitter >/dev/null 2>&1; then
-    npm uninstall -g tree-sitter-cli 2>/dev/null || sudo npm uninstall -g tree-sitter-cli 2>/dev/null
-    echo "[Removed] tree-sitter-cli"
-elif [ "${PREEXISTING_TREESITTER_CLI:-0}" -eq 1 ]; then
-    echo "[Left in place] tree-sitter-cli (predates dotfiles)"
-fi
+if [ "${SNAPSHOT_VERSION:-1}" -lt 4 ]; then
+    if [ -f "$STATE_DIR/tree-sitter-local-installed" ]; then
+        rm -f "$HOME/.local/bin/tree-sitter"
+        rm -rf "$HOME/.local/lib/node_modules/tree-sitter-cli"
+        echo "[Removed] user-local tree-sitter-cli"
+    elif [ "${SNAPSHOT_VERSION:-1}" -eq 1 ] &&
+         [ "${PREEXISTING_TREESITTER_CLI:-0}" -eq 0 ] && command -v tree-sitter >/dev/null 2>&1; then
+        npm uninstall -g tree-sitter-cli 2>/dev/null || sudo npm uninstall -g tree-sitter-cli 2>/dev/null
+        echo "[Removed] tree-sitter-cli"
+    elif [ "${PREEXISTING_TREESITTER_CLI:-0}" -eq 1 ]; then
+        echo "[Left in place] tree-sitter-cli (predates dotfiles)"
+    fi
 
-if [ "${PREEXISTING_TPM:-0}" -eq 0 ]; then
-    rm -rf "$HOME/.tmux/plugins" && echo "[Removed] ~/.tmux/plugins"
-else
-    echo "[Left in place] ~/.tmux/plugins (predates dotfiles)"
+    if [ "${PREEXISTING_TPM:-0}" -eq 0 ]; then
+        rm -rf "$HOME/.tmux/plugins" && echo "[Removed] ~/.tmux/plugins"
+    else
+        echo "[Left in place] ~/.tmux/plugins (predates dotfiles)"
+    fi
 fi
 
 if [ "${PREEXISTING_NVIM_DATA:-0}" -eq 0 ]; then
@@ -196,7 +235,9 @@ if [[ "$OS" == "Darwin" ]]; then
     fi
 fi
 
-# Recompute distro family fresh (same machine, same logic as install.sh).
+if [ "${MANAGED_SYSTEM_PACKAGES:-1}" -eq 1 ]; then
+# Legacy installs may have installed system packages.
+# Recompute distro family for their original snapshot.
 DISTRO_FAMILY="" RHEL_PKG=""
 if [[ "$OS" == "Linux" ]]; then
     if command -v apt-get &>/dev/null; then
@@ -275,9 +316,54 @@ else
         *) echo "Left packages in place." ;;
     esac
 fi
+else
+    [ -s "$STATE_DIR/system-packages-installed" ] ||
+        echo "[Packages] This install did not manage system packages."
+fi
+
+if [ "${MANAGED_SYSTEM_PACKAGES:-1}" -eq 0 ] &&
+   [ -s "$STATE_DIR/system-packages-installed" ]; then
+    echo
+    echo "==== Packages installed by dotfiles ===="
+    if command -v apt-get >/dev/null 2>&1; then
+        ledger_family=debian
+        ledger_manager=apt-get
+    elif command -v dnf >/dev/null 2>&1; then
+        ledger_family=rhel
+        ledger_manager=dnf
+    else
+        ledger_family=rhel
+        ledger_manager=yum
+    fi
+    to_remove=()
+    while read -r recorded_family recorded_package; do
+        [ "$recorded_family" = "$ledger_family" ] || continue
+        case "$recorded_package" in
+            ""|-*|*[!a-zA-Z0-9+_.-]*) continue ;;
+        esac
+        protected=0
+        for protected_package in "${PKGS_NEVER_REMOVE[@]}"; do
+            [ "$recorded_package" = "$protected_package" ] && protected=1
+        done
+        [ "$protected" -eq 0 ] && to_remove+=("$recorded_package")
+    done < "$STATE_DIR/system-packages-installed"
+
+    if [ "${#to_remove[@]}" -eq 0 ]; then
+        echo "No removable system packages were installed by dotfiles."
+    else
+        printf '  %s\n' "${to_remove[@]}"
+        echo "Removing shared packages can affect other software."
+        read -p "Remove these system packages? [y/N] " ans
+        case "$ans" in
+            y|Y|yes|Yes) sudo "$ledger_manager" remove -y "${to_remove[@]}" ;;
+            *) echo "Left system packages in place." ;;
+        esac
+    fi
+fi
 
 echo
 echo "==== Login shell ===="
+if [ "${MANAGED_LOGIN_SHELL:-1}" -eq 1 ]; then
 CUR_SHELL="$(getent passwd "$USER" 2>/dev/null | cut -d: -f7)"
 [ -z "$CUR_SHELL" ] && CUR_SHELL="$SHELL"
 if [ -n "${ORIGINAL_SHELL:-}" ] && [ -x "$ORIGINAL_SHELL" ] && [ "$CUR_SHELL" != "$ORIGINAL_SHELL" ]; then
@@ -296,6 +382,7 @@ elif [ -n "${ORIGINAL_SHELL:-}" ] && [ ! -x "$ORIGINAL_SHELL" ]; then
     echo "Recorded original shell ($ORIGINAL_SHELL) no longer exists on this machine — leaving login shell as $CUR_SHELL."
 else
     echo "Login shell already matches the original — nothing to revert."
+fi
 fi
 
 read -p "Remove the dotfiles folder itself ($DOTFILES_DIR)? [y/N] " ans

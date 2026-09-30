@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Minimal setup for a client / jump machine (corporate MacBook, restricted env).
-# Symlinks dotfiles, installs a user-local terminal font, and configures tools
+# Symlinks dotfiles, offers a user-local terminal font, and configures tools
 # that are already installed.
 # Does NOT install Homebrew packages or run curl-pipe-sh installers.
 #
 # What this sets up:
-#   - zsh config (oh-my-zsh + p10k, installed via git if missing)
+#   - zsh config
 #   - tmux config (if tmux is installed)
 #   - nvim config (if nvim is installed)
-#   - FiraCode Nerd Font in the current macOS user account
+#   - optional FiraCode Nerd Font in the current macOS user account
 #   - iTerm2 TokyoNight profile + default profile + clipboard access
 #   - The `s` / `sfd` functions for connecting to your dev servers
 #
@@ -35,18 +35,21 @@ create_symlink() {
     echo "[Link]   $dest -> $src"
 }
 
-try_git_clone() {
-    local url=$1 dest=$2 label=$3
-    if [ -d "$dest" ]; then return 0; fi
-    echo "[Client] Installing $label..."
-    git clone --depth=1 "$url" "$dest" \
-        || echo "[WARN] $label install failed — network may be restricted. Install manually later."
-}
-
 install_macos_nerd_font() {
     local user_font_dir="$HOME/Library/Fonts"
     local regular_font="$user_font_dir/FiraCodeNerdFontMono-Regular.ttf"
     [ -f "$regular_font" ] && return 0
+
+    echo "[Font] Optional FiraCode Nerd Font"
+    echo "  Downloads and extracts a third-party Nerd Font ZIP from GitHub."
+    echo "  No additional packages are needed on macOS."
+    printf 'Install the font for this user? [y/N] '
+    local font_answer
+    IFS= read -r font_answer || font_answer=
+    case "$font_answer" in
+        y|Y|yes|Yes) ;;
+        *) echo "[Font] Skipped."; return 0 ;;
+    esac
 
     local temp_dir archive
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-font.XXXXXX")" || {
@@ -82,55 +85,14 @@ install_macos_nerd_font() {
 # Shell config
 # -----------------------------------------------------------------------------
 create_symlink "$DOTFILES_DIR/zsh/.zshrc"       "$HOME/.zshrc"
-create_symlink "$DOTFILES_DIR/zsh/.p10k.zsh"    "$HOME/.p10k.zsh"
 create_symlink "$DOTFILES_DIR/zsh/.bashrc"       "$HOME/.bashrc"
 create_symlink "$DOTFILES_DIR/zsh/.bash_profile" "$HOME/.bash_profile"
-
-# Set zsh as the login shell — but only when a switch is actually needed and
-# can succeed non-interactively. If the current login shell is already *a* zsh
-# (e.g. Apple's /bin/zsh), leave it: chsh here only nags for a password to swap
-# one zsh for another (Homebrew's), for no real gain. And chsh only accepts a
-# target listed in /etc/shells; a target that isn't there prompts for a password
-# and then fails anyway — so skip it and tell the user how to opt in.
-ZSH_BIN="$(command -v zsh 2>/dev/null)"
-case "$SHELL" in
-    *zsh) ;;  # already on a zsh login shell — nothing to do
-    *)
-        if [ -n "$ZSH_BIN" ]; then
-            if grep -qx "$ZSH_BIN" /etc/shells 2>/dev/null; then
-                chsh -s "$ZSH_BIN" 2>/dev/null \
-                    && echo "[Shell] Login shell set to $ZSH_BIN." \
-                    || echo "[WARN] chsh failed — run manually: chsh -s $ZSH_BIN"
-            else
-                echo "[Shell] $ZSH_BIN not in /etc/shells; leaving login shell as $SHELL."
-                echo "        To use it: sudo sh -c 'echo $ZSH_BIN >> /etc/shells' && chsh -s $ZSH_BIN"
-            fi
-        fi
-        ;;
-esac
-
-# oh-my-zsh (git clone, no curl-pipe-sh)
-if [ ! -d "$HOME/.oh-my-zsh" ]; then
-    echo "[Client] Installing Oh-My-Zsh..."
-    git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$HOME/.oh-my-zsh" \
-        || echo "[WARN] oh-my-zsh install failed. Install manually: https://ohmyz.sh"
-fi
-
-# Powerlevel10k theme
-try_git_clone \
-    https://github.com/romkatv/powerlevel10k.git \
-    "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k" \
-    "Powerlevel10k"
 
 # -----------------------------------------------------------------------------
 # tmux (only if installed)
 # -----------------------------------------------------------------------------
 if command -v tmux &>/dev/null; then
     create_symlink "$DOTFILES_DIR/tmux/.tmux.conf" "$HOME/.tmux.conf"
-    try_git_clone \
-        https://github.com/tmux-plugins/tpm \
-        "$HOME/.tmux/plugins/tpm" \
-        "TPM (tmux plugin manager)"
 else
     echo "[Skip]   tmux not found — skipping tmux config."
 fi

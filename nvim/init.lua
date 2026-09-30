@@ -112,6 +112,8 @@ require("lazy").setup({
     "nvim-tree/nvim-tree.lua",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     opts = {
+      disable_netrw = true,
+      hijack_netrw = false,
       actions = { use_system_clipboard = true },
       -- Copy via '+' so it rides OSC 52 to the Mac clipboard.
       on_attach = function(bufnr)
@@ -137,74 +139,21 @@ require("lazy").setup({
   { "nvim-telescope/telescope.nvim", dependencies = { "nvim-lua/plenary.nvim" }, opts = {} },
   { "tpope/vim-fugitive" },
 
-  -- Syntax & Parsing (nvim-treesitter `main` branch — Neovim 0.11+ API)
-  {
-    "nvim-treesitter/nvim-treesitter",
-    branch = "main",
-    lazy = false,
-    build = ":TSUpdate",
-    config = function()
-      local ts = require("nvim-treesitter")
-      -- Guard: skip when the plugin hasn't been synced to the `main` branch yet
-      -- (master has no .install), so startup never hard-errors. Run :Lazy restore.
-      if ts.install then ts.install({ "c", "cpp", "lua", "rust", "python", "bash", "markdown", "markdown_inline" }) end
-      vim.api.nvim_create_autocmd("FileType", {
-        pattern = { "c", "cpp", "lua", "rust", "python", "sh", "markdown" },
-        callback = function() pcall(vim.treesitter.start) end,
-        desc = "Enable treesitter highlighting",
-      })
-    end
-  },
   { "windwp/nvim-autopairs", opts = {} },
 
   -- LSP & Auto-Completion
   {
-    "williamboman/mason.nvim",
-    opts = {},
-    config = function(_, opts)
-      require("mason").setup(opts)
-      -- Interrupted installs can leave broken links that block Mason's next install.
-      local uv = vim.uv or vim.loop
-      local root = require("mason.settings").current.install_root_dir
-      for _, name in ipairs({ "clangd", "pyright", "lua-language-server" }) do
-        local path = root .. "/bin/" .. name
-        local target = uv.fs_readlink(path)
-        local _, _, err = uv.fs_stat(path)
-        if target and target:match("^%.%./packages/") and err == "ENOENT" then
-          local ok, unlink_err = uv.fs_unlink(path)
-          if not ok then
-            vim.notify("Mason: cannot remove broken link " .. path .. ": " .. unlink_err, vim.log.levels.WARN)
-          end
-        end
-      end
-    end,
-  },
-  {
-    "williamboman/mason-lspconfig.nvim",
-    dependencies = { "williamboman/mason.nvim" },
+    "neovim/nvim-lspconfig",
+    dependencies = { "hrsh7th/cmp-nvim-lsp" },
     config = function()
-      local servers = { "clangd", "pyright", "lua_ls" }
-      require("mason-lspconfig").setup({
-        ensure_installed = servers,
-        automatic_installation = false,
-      })
-      local capabilities = require('cmp_nvim_lsp').default_capabilities()
-      for _, server_name in ipairs(servers) do
-        local config = { capabilities = capabilities }
-        if server_name == "lua_ls" then
-          config.settings = { Lua = { diagnostics = { globals = { "vim" } } } }
-        end
-        if vim.fn.has("nvim-0.11") == 1 then
-          vim.lsp.config(server_name, config)
-          vim.lsp.enable(server_name)
-        else
-          require("lspconfig")[server_name].setup(config)
-        end
+      if vim.fn.executable("clangd") == 1 then
+        vim.lsp.config("clangd", {
+          capabilities = require("cmp_nvim_lsp").default_capabilities(),
+        })
+        vim.lsp.enable("clangd")
       end
     end
   },
-  { "neovim/nvim-lspconfig" },
-  { "mrcjkb/rustaceanvim", version = "^4", ft = { "rust" } },
   {
     "hrsh7th/nvim-cmp",
     dependencies = {

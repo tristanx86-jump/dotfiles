@@ -1,21 +1,18 @@
-# Switch to zsh for interactive shells — fires when chsh hasn't taken effect yet
-# or the login shell is still bash for any reason.
+# Start zsh for interactive shells when the login shell is bash.
+_old_tools_path="$HOME/.local/share/dotfiles/tools/bin"
+while [[ ":$PATH:" == *":$_old_tools_path:"* ]]; do
+    PATH=":$PATH:"
+    PATH="${PATH/:$_old_tools_path:/:}"
+    PATH="${PATH#:}"
+    PATH="${PATH%:}"
+done
+unset _old_tools_path
+export PATH="$HOME/.local/bin:$PATH"
 [[ $- == *i* ]] && command -v zsh >/dev/null 2>&1 && exec zsh -l
 
 # ── Everything below only runs when zsh is genuinely unavailable ──────────────
 
 export EDITOR="nvim"
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-# Homebrew (macOS)
-if [[ -f "/opt/homebrew/bin/brew" ]]; then
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-elif [[ -f "/usr/local/bin/brew" ]]; then
-    eval "$(/usr/local/bin/brew shellenv)"
-fi
-
-# Rust
-[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
 # Aliases
 alias ll='ls -la'

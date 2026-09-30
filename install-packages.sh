@@ -1,6 +1,5 @@
-# Package lists shared between install.sh and wipe.sh — single source of
-# truth so wipedot's "what did dotfiles actually install" tracking can't
-# drift out of sync with what install.sh actually installs.
+# Package lists from the old installer that used system package managers.
+# wipe.sh uses these only when cleaning up a legacy install snapshot.
 
 DEBIAN_PKGS=(build-essential git zsh curl wget unzip tar
              xclip nodejs npm ripgrep fd-find python3-venv

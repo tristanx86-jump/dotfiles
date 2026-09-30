@@ -1,11 +1,6 @@
-# Enable Powerlevel10k instant prompt.
-# This block must remain at the top of ~/.zshrc.
-if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
-  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
-fi
-
 # ── Environment & Path Configuration ─────────────────
-export ZSH="$HOME/.oh-my-zsh"
+path=("${(@)path:#$HOME/.local/share/dotfiles/tools/bin}")
+export PATH="$HOME/.local/bin:$PATH"
 if command -v nvim &>/dev/null; then
     export EDITOR="nvim"
     export VISUAL="nvim"
@@ -32,22 +27,6 @@ DOTFILES_REPO_URL="https://github.com/${DOTFILES_REPO_OWNER}/dotfiles.git"
 
 # ── macOS Configuration ──────────────────────────────
 if [[ "$OS" == "Darwin" ]]; then
-    # Homebrew Setup (Apple Silicon / Intel fallback)
-    if [[ -f "/opt/homebrew/bin/brew" ]]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    elif [[ -f "/usr/local/bin/brew" ]]; then
-        eval "$(/usr/local/bin/brew shellenv)"
-    fi
-
-    # Build Flags — only set when brew is available (skipped on restricted machines).
-    if command -v brew &>/dev/null; then
-        _brew_prefix="$(brew --prefix)"
-        export LDFLAGS="-L${_brew_prefix}/opt/openssl/lib"
-        export CPPFLAGS="-I${_brew_prefix}/opt/openssl/include"
-        export PATH="${_brew_prefix}/opt/llvm/bin:$PATH"
-        unset _brew_prefix
-    fi
-
     # Host / SSH management ('s'/'m'/'sfd') lives in hosts.zsh — see that file.
     [ -r "$DOTFILES_ZSH_DIR/hosts.zsh" ] && source "$DOTFILES_ZSH_DIR/hosts.zsh"
 
@@ -75,18 +54,10 @@ elif [[ "$OS" == "Linux" ]]; then
     alias display-on="xset dpms force on"
 fi
 
-# ── Oh My Zsh Plugins ────────────────────────────────
-ZSH_THEME="powerlevel10k/powerlevel10k"
-
-# Plugins:
-# - git: standard git aliases
-# - sudo: double-tap ESC to prepend sudo
-# Note: 'z' has been removed in favor of zoxide at the EOF.
-plugins=(git sudo)
-
-if [ -f "$ZSH/oh-my-zsh.sh" ]; then
-  source "$ZSH/oh-my-zsh.sh"
-fi
+# ── Prompt ───────────────────────────────────────────
+autoload -Uz compinit
+compinit
+PROMPT='%n@%m %~ %# '
 
 # ── Aliases: General ─────────────────────────────────
 alias v='nvim'
@@ -276,12 +247,3 @@ function clockspeed() {
     fi
     sudo cpupower frequency-set -u "${1}GHz" -d "${1}GHz"
 }
-
-# ── Prompt Configuration ─────────────────────────────
-[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
-
-# ── Zoxide Initialization ────────────────────────────
-# Replaces 'z' plugin for faster, algorithm-based directory jumping.
-# Must be initialized at the end of the file.
-command -v zoxide &>/dev/null && eval "$(zoxide init zsh)"
-export PATH="$HOME/.local/bin:$PATH"
