@@ -1246,6 +1246,14 @@ _floodsd_ensure_dpdk() {
     echo "Building Pktgen-DPDK (meson + ninja), installing to $PKTGEN_PREFIX..."
     (
         cd "$PKTGEN_SRC_DIR" || exit 1
+        # Pktgen's unused LPM include breaks with some packaged DPDK builds.
+        if [ -f lib/common/cksum.c ] && grep -q '^#include <rte_lpm\.h>$' lib/common/cksum.c; then
+            local cksum_backup
+            cksum_backup=$(mktemp "$(dirname "$PKTGEN_SRC_DIR")/pktgen-cksum.XXXXXX") || exit 1
+            cp -p lib/common/cksum.c "$cksum_backup" || { rm -f "$cksum_backup"; exit 1; }
+            trap 'cp -p "$cksum_backup" lib/common/cksum.c && rm -f "$cksum_backup" || exit 1' EXIT
+            sed -i '/^#include <rte_lpm\.h>$/d' lib/common/cksum.c || exit 1
+        fi
         rm -rf build
         meson setup build --prefix="$PKTGEN_PREFIX" --libdir=lib || exit 1
         ninja -C build || exit 1
