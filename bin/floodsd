@@ -1319,13 +1319,13 @@ _floodsd_ensure_dpdk() {
     case "$pkgmgr" in
         apt)
             sudo apt-get update -y
-            sudo apt-get install -y dpdk dpdk-dev meson ninja-build pkg-config libnuma-dev git gcc make \
+            sudo apt-get install -y dpdk dpdk-dev meson ninja-build pkg-config libnuma-dev libpcap-dev libbsd-dev git gcc make \
                 || { echo "floodsd dpdk: package install failed — install DPDK manually and re-run."; return 1; }
             ;;
         dnf|yum)
             # Minimal RHEL-family images (Rocky/Alma/RHEL 9) often lack a C
             # toolchain entirely — gcc/make aren't pulled in by dpdk-devel.
-            local dpdk_pkgs=(dpdk dpdk-devel meson ninja-build pkgconf-pkg-config numactl-devel git gcc make)
+            local dpdk_pkgs=(dpdk dpdk-devel meson ninja-build pkgconf-pkg-config numactl-devel libpcap-devel libbsd-devel git gcc make)
             if ! sudo "$pkgmgr" install -y "${dpdk_pkgs[@]}" 2>/dev/null; then
                 # dpdk-devel is sometimes unresolvable on a minimal RHEL-family 9
                 # install until EPEL + CRB (CodeReady Builder, formerly
