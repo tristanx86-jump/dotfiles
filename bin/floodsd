@@ -10,8 +10,8 @@
 # `floodsd dpdk`) apt/dnf/yum.
 #
 # Load-tests a remote firedancer validator from a *separate* box: always
-# sends 64B (min-sized) UDP packets to dport 9000. By default it uses a
-# single source port (8424; see FLOOD_SPORT below), pinning the flood to one
+# sends 64B (min-sized) UDP packets to dport 9000, or 8003 with `shred`.
+# The default source port (8424, see FLOOD_SPORT below) pins the flood to one
 # of the target's RX queues / net tiles. Pass --multiport to `floodsd setup`
 # / `floodsd kernel` to instead rotate the src port across a small range
 # (FLOOD_SPORT..FLOOD_SPORT+FLOOD_SPORT_CNT-1) so the target's NIC hashes the
@@ -93,6 +93,15 @@ _fd_parse_multiport() {
 }
 _fd_sport_cnt() {
     if [ "$FLOOD_MULTIPORT" = 1 ]; then echo "${FLOOD_SPORT_CNT:-1}"; else echo 1; fi
+}
+
+_fd_parse_dport() {
+    local a
+    for a in "$@"; do
+        if [ "$a" = shred ]; then
+            FLOOD_DPORT=8003
+        fi
+    done
 }
 
 FLOODSD_STATE_DIR="$HOME/.config/floodsd"
@@ -979,6 +988,7 @@ _fd_kernel_write() {
 # is what's supposed to guarantee nothing is left running/attached.
 _floodsd_kernel() {
     _fd_parse_multiport "$@"
+    _fd_parse_dport "$@"
     local iface destip destmac
     iface=$(_floodsd_get if); destip=$(_floodsd_get destip); destmac=$(_floodsd_get destmac)
     if [ -z "$iface" ] || [ -z "$destip" ] || [ -z "$destmac" ]; then
@@ -1129,9 +1139,9 @@ _floodsd_kernel() {
     _fd_kernel_set_delay "$rate" "$ncores" "${devs[@]}"
 
     if [ "$niface" -gt 1 ]; then
-        echo "Configured $ncores TX cores (cores $lo-$hi) across ${niface} slaves (${ifaces[*]}) -> $destip ($destmac)."
+        echo "Configured $ncores TX cores (cores $lo-$hi) across ${niface} slaves (${ifaces[*]}) -> $destip:$FLOOD_DPORT ($destmac)."
     else
-        echo "Configured $ncores TX cores (cores $lo-$hi) -> $destip ($destmac) via ${ifaces[0]}."
+        echo "Configured $ncores TX cores (cores $lo-$hi) -> $destip:$FLOOD_DPORT ($destmac) via ${ifaces[0]}."
     fi
     echo "Commands: start | start <mpps|max> | stop | rate | quit"
 
@@ -1374,6 +1384,7 @@ _floodsd_ensure_dpdk() {
 # their count. Leaves you at pktgen's interactive prompt — 'start 0' and
 # rate-limiting ('set 0 rate <pct>') are yours to run by hand.
 _floodsd_dpdk() {
+    _fd_parse_dport "$@"
     local iface destip destmac
     iface=$(_floodsd_get if); destip=$(_floodsd_get destip); destmac=$(_floodsd_get destmac)
     if [ -z "$iface" ] || [ -z "$destip" ] || [ -z "$destmac" ]; then
@@ -1470,7 +1481,7 @@ range 0 size inc 0
 enable 0 range
 EOF
 
-    echo "Launching pktgen on $iface ($pci) -> $destip ($destmac), lcores $lcores (main $main)..."
+    echo "Launching pktgen on $iface ($pci) -> $destip:$FLOOD_DPORT ($destmac), lcores $lcores (main $main)..."
     echo "(pktgen drops you at its interactive prompt — run 'start 0' yourself when ready.)"
     # Absolute path (not just "pktgen"): sudo's secure_path typically strips
     # ~/.local/bin from PATH. LD_LIBRARY_PATH is passed explicitly through
@@ -1576,7 +1587,7 @@ floodsd() {
         stop)          shift; _floodsd_stop "$@";          return ;;
         restore)       shift; _floodsd_restore "$@";       return ;;
         *)
-            echo "Usage: floodsd setup [--multiport] | setup-srcport | diagnose [--multiport] | dpdk | kernel [--multiport] | stop | restore"
+            echo "Usage: floodsd setup [--multiport] | setup-srcport | diagnose [--multiport] | dpdk [shred] | kernel [shred] [--multiport] | stop | restore"
             return 1
             ;;
     esac
