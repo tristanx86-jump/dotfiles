@@ -196,41 +196,37 @@ _fd_is_mellanox() {
     case "$ans" in y|Y|yes|Yes) return 0 ;; *) return 1 ;; esac
 }
 
-# _fd_lcore_plan <prefix> <ntx>: lays out DPDK lcores top-down (fits a
-# 16-core box): main 15 | RX 14 | TX 13, 12, ... Every core past the main
-# and RX cores is a dedicated TX (generation) core, and TX throughput scales
-# with their count. DPDK would otherwise default the main lcore to the
-# lowest core in -l (a TX core here), so it's pinned explicitly with
-# --main-lcore. On success prints "<main> <rxcore> <txlo> <txrange> <lcores>
-# <map> <est>" to stdout; on failure (machine too small, or <ntx> would run
-# past core 0) prints an error prefixed with <prefix> and returns 1.
+# _fd_lcore_plan selects the highest available CPUs for DPDK.
+# It prints the main CPU, RX CPU, TX CPU list, full CPU list, Pktgen mapping
+# and estimated throughput.
 _fd_lcore_plan() {
-    local prefix=$1 ntx=$2
-    local main=15 rxcore=14 txhi=13
-    local txlo=$((txhi - ntx + 1))
-    if [ ! -d "/sys/devices/system/cpu/cpu$main" ]; then
-        echo "$prefix: layout needs at least 16 cores (uses up to core $main); machine has $(nproc)." >&2
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "$1: python3 is required to select available CPUs." >&2
         return 1
     fi
-    if [ "$txlo" -lt 0 ]; then
-        echo "$prefix: $ntx TX cores would run past core 0 (lowest = $txlo). Choose fewer." >&2
-        return 1
-    fi
-    local lcores="${txlo}-${main}"
-    local txrange="$txhi"
-    [ "$txlo" -lt "$txhi" ] && txrange="${txlo}-${txhi}"
-    local map="[${rxcore}:${txrange}].0"
-    local est=$((ntx * 30))
-    echo "$main $rxcore $txlo $txrange $lcores $map $est"
+    python3 - "$1" "$2" <<'PYEOF'
+import os, sys
+
+prefix, tx_cnt = sys.argv[1], int(sys.argv[2])
+cpus = sorted(os.sched_getaffinity(0))
+if tx_cnt < 1 or tx_cnt + 2 > len(cpus):
+    sys.exit(f"{prefix}: {tx_cnt} TX cores need {tx_cnt + 2} available CPUs, but only {len(cpus)} are allowed. Choose fewer TX cores.")
+
+selected = cpus[-(tx_cnt + 2):]
+main, rxcore = selected[-1], selected[-2]
+txcores = ','.join(str(cpu) for cpu in selected[:-2])
+lcores = ','.join(str(cpu) for cpu in selected)
+mapping = f"[{rxcore}:{txcores.replace(',', '/')}].0"
+print(main, rxcore, txcores, lcores, mapping, tx_cnt * 30)
+PYEOF
 }
 
-# _fd_check_numa <prefix> <iface> <nicnode> <lo> <hi>: warns if any core in
-# [lo, hi] isn't on the NIC's NUMA node — cross-socket DMA skews throughput.
+# _fd_check_numa checks the selected CPUs against the NIC's NUMA node.
 _fd_check_numa() {
-    local prefix=$1 iface=$2 nicnode=$3 lo=$4 hi=$5
+    local prefix=$1 iface=$2 nicnode=$3 lcores=$4
     if [ -z "$nicnode" ] || [ "$nicnode" = "-1" ]; then return 0; fi
     local c cnode badcores="" n
-    for ((c = lo; c <= hi; c++)); do
+    for c in ${lcores//,/ }; do
         cnode=""
         for n in /sys/devices/system/cpu/cpu$c/node*; do
             [ -e "$n" ] || continue
@@ -1294,9 +1290,9 @@ _floodsd_dpdk() {
     fi
     _floodsd_set dpdkcores "$ntx"
 
-    local plan main rxcore txlo txrange lcores map est
+    local plan main rxcore txcores lcores map est
     plan=$(_fd_lcore_plan "floodsd dpdk" "$ntx") || return 1
-    read -r main rxcore txlo txrange lcores map est <<< "$plan"
+    read -r main rxcore txcores lcores map est <<< "$plan"
 
     _floodsd_ensure_dpdk || return 1
     if [ ! -e "/sys/class/net/$iface" ]; then
@@ -1325,12 +1321,12 @@ _floodsd_dpdk() {
     local mellanox=0
     _fd_is_mellanox "$iface" "$curdrv" && mellanox=1
 
-    _fd_check_numa "floodsd dpdk" "$iface" "$nicnode" "$txlo" "$main"
+    _fd_check_numa "floodsd dpdk" "$iface" "$nicnode" "$lcores"
 
     echo "DPDK pktgen core plan on $iface:"
     echo "  $main    main lcore (DPDK control/CLI — no traffic)"
     echo "  $rxcore    RX core"
-    echo "  $txrange  TX core(s) x$ntx  ->  ~${est} Mpps max (rough 30 Mpps/core guide, capped by NIC line rate)"
+    echo "  $txcores  TX core(s) x$ntx  ->  ~${est} Mpps max (rough 30 Mpps/core guide, capped by NIC line rate)"
 
     _fd_reserve_hugepages "$ntx"
 
