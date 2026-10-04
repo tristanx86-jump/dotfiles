@@ -1140,16 +1140,46 @@ _floodsd_stop() {
     fi
 }
 
-# _floodsd_ensure_dpdk: install DPDK + build Pktgen-DPDK from source if it
-# hasn't been built yet. DPDK's dev packages are in standard distro repos
-# (no user-dir equivalent without rebuilding DPDK itself from source, so
-# this is the one system-wide install floodsd makes) but Pktgen-DPDK itself
-# normally isn't packaged, so it's built from source into ~/.local/src and
-# installed into ~/.local (bin + lib) — never /usr/local, since this box
-# usually isn't yours.
 PKTGEN_SRC_DIR="$HOME/.local/src/pktgen-dpdk"
 PKTGEN_PREFIX="$HOME/.local"
 PKTGEN_BIN="$PKTGEN_PREFIX/bin/pktgen"
+FLOODSD_DPDK_PREFIX="$HOME/.local/share/floodsd/dpdk-25.11"
+
+_floodsd_dpdk_pkg_config() {
+    if [ -f "$FLOODSD_DPDK_PREFIX/floodsd-built" ]; then
+        PKG_CONFIG_PATH="$FLOODSD_DPDK_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" pkg-config "$@"
+    else
+        pkg-config "$@"
+    fi
+}
+
+_floodsd_build_dpdk() {
+    local source="$HOME/.local/src/floodsd-dpdk-25.11" build head changes
+    local commit=ed957165eadbe60a47d5ec223578cdd1c13d0bd9
+    mkdir -p "$(dirname "$source")" "$HOME/.cache/floodsd" || return 1
+    if [ ! -d "$source/.git" ]; then
+        git clone --depth 1 --branch v25.11 https://github.com/DPDK/dpdk.git "$source" || return 1
+    fi
+    head=$(git -C "$source" rev-parse HEAD) || return 1
+    changes=$(git -C "$source" status --porcelain) || return 1
+    if [ "$head" != "$commit" ] || [ -n "$changes" ]; then
+        echo "floodsd dpdk: local DPDK source differs from the audited release." >&2
+        return 1
+    fi
+    build=$(mktemp -d "$HOME/.cache/floodsd/dpdk-build.XXXXXX") || return 1
+    echo "Building DPDK 25.11 under $FLOODSD_DPDK_PREFIX..."
+    meson setup "$build" "$source" --prefix="$FLOODSD_DPDK_PREFIX" --libdir=lib \
+        -Ddefault_library=shared -Ddeveloper_mode=disabled -Dtests=false -Ddisable_apps='*' \
+        -Denable_drivers=bus/pci,bus/vdev,bus/auxiliary,common/mlx5,mempool/ring,net/mlx5,net/ice,net/i40e,net/ixgbe \
+        || return 1
+    if ! grep -q '^#define HAVE_IBV_FLOW_DV_SUPPORT 1$' "$build/drivers/common/mlx5/mlx5_autoconf.h" || \
+       ! grep -q '^#define RTE_NET_MLX5 1$' "$build/rte_build_config.h"; then
+        echo "floodsd dpdk: this DPDK build lacks the required mlx5 support." >&2
+        return 1
+    fi
+    ninja -C "$build" -j 2 && ninja -C "$build" install || return 1
+    printf '%s\n' "$commit" > "$FLOODSD_DPDK_PREFIX/floodsd-built" || return 1
+}
 
 # _floodsd_patch_pktgen isolates mlx5 reception before configuring any port.
 _floodsd_patch_pktgen() {
@@ -1202,7 +1232,7 @@ floodsd_prepare_ports(void)
             if (rte_flow_isolate(pid, 1, &error))
                 rte_exit(EXIT_FAILURE, "Cannot isolate mlx5 RX on port %u, %s.\n",
                          pid, error.message ? error.message : "unsupported");
-            pktgen_log_info("floodsd mlx5 receive isolation v2, port %u", pid);
+            pktgen_log_info("floodsd mlx5 receive isolation v3, port %u", pid);
         }
         expected = strtok_r(NULL, ",", &next);
     }
@@ -1230,15 +1260,22 @@ path.write_text(source)
 PYEOF
 }
 
+# _floodsd_ensure_dpdk builds protected Pktgen against DPDK 25.11.
 _floodsd_ensure_dpdk() {
-    if [ -x "$PKTGEN_BIN" ] && grep -aqF 'floodsd mlx5 receive isolation v2' "$PKTGEN_BIN"; then
-        return 0
-    fi
+    local dpdk_version
+    dpdk_version=$(_floodsd_dpdk_pkg_config --modversion libdpdk 2>/dev/null) || dpdk_version=""
+    case "$dpdk_version" in
+        25.11|25.11.*)
+            if [ -x "$PKTGEN_BIN" ] && grep -aqF 'floodsd mlx5 receive isolation v3' "$PKTGEN_BIN"; then
+                return 0
+            fi
+            ;;
+    esac
 
     echo "floodsd dpdk: building Pktgen with mlx5 receive isolation."
     echo "  This installs DPDK's dev packages via the system package manager (the"
-    echo "  one system-wide step — no user-dir equivalent), then clones + builds"
-    echo "  Pktgen-DPDK from source into $PKTGEN_SRC_DIR, installed to $PKTGEN_PREFIX."
+    echo "  system-wide step), then builds Pktgen under $PKTGEN_PREFIX."
+    echo "  If packaged DPDK is unsuitable, DPDK 25.11 is built under $FLOODSD_DPDK_PREFIX."
     local ans
     read -rp "Proceed? [y/N] " ans
     case "$ans" in
@@ -1261,14 +1298,15 @@ _floodsd_ensure_dpdk() {
     echo "Installing DPDK + build dependencies ($pkgmgr)..."
     case "$pkgmgr" in
         apt)
-            sudo apt-get update -y
-            sudo apt-get install -y dpdk dpdk-dev meson ninja-build pkg-config libnuma-dev libpcap-dev libbsd-dev git gcc make \
+            sudo apt-get update -y || return 1
+            sudo apt-get install -y dpdk dpdk-dev meson ninja-build pkg-config libnuma-dev libpcap-dev libbsd-dev \
+                libibverbs-dev librdmacm-dev libelf-dev python3-pyelftools git gcc make \
                 || { echo "floodsd dpdk: package install failed — install DPDK manually and re-run."; return 1; }
             ;;
         dnf|yum)
             # Minimal RHEL-family images (Rocky/Alma/RHEL 9) often lack a C
             # toolchain entirely — gcc/make aren't pulled in by dpdk-devel.
-            local dpdk_pkgs=(dpdk dpdk-devel meson ninja-build pkgconf-pkg-config numactl-devel libpcap-devel libbsd-devel git gcc make)
+            local dpdk_pkgs=(dpdk dpdk-devel meson ninja-build pkgconf-pkg-config numactl-devel libpcap-devel libbsd-devel rdma-core-devel elfutils-libelf-devel python3-pyelftools git gcc make)
             if ! sudo "$pkgmgr" install -y "${dpdk_pkgs[@]}" 2>/dev/null; then
                 # dpdk-devel is sometimes unresolvable on a minimal RHEL-family 9
                 # install until EPEL + CRB (CodeReady Builder, formerly
@@ -1284,6 +1322,12 @@ _floodsd_ensure_dpdk() {
             ;;
     esac
 
+    dpdk_version=$(_floodsd_dpdk_pkg_config --modversion libdpdk 2>/dev/null) || dpdk_version=""
+    case "$dpdk_version" in
+        25.11|25.11.*) ;;
+        *) _floodsd_build_dpdk || return 1 ;;
+    esac
+
     mkdir -p "$(dirname "$PKTGEN_SRC_DIR")"
     if [ -d "$PKTGEN_SRC_DIR/.git" ]; then
         echo "Updating existing Pktgen-DPDK checkout..."
@@ -1296,6 +1340,12 @@ _floodsd_ensure_dpdk() {
     echo "Building Pktgen-DPDK (meson + ninja), installing to $PKTGEN_PREFIX..."
     (
         cd "$PKTGEN_SRC_DIR" || exit 1
+        local dpdk_libdir
+        dpdk_libdir=$(_floodsd_dpdk_pkg_config --variable=libdir libdpdk) || exit 1
+        if [ -f "$FLOODSD_DPDK_PREFIX/floodsd-built" ]; then
+            export PKG_CONFIG_PATH="$FLOODSD_DPDK_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        fi
+        export LD_LIBRARY_PATH="$dpdk_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         local backup
         backup=$(mktemp -d "$(dirname "$PKTGEN_SRC_DIR")/pktgen-build.XXXXXX") || exit 1
         cp -p app/pktgen-port-cfg.c "$backup/port.c" && cp -p lib/common/cksum.c "$backup/cksum.c" || exit 1
@@ -1303,12 +1353,12 @@ _floodsd_ensure_dpdk() {
         _floodsd_patch_pktgen || exit 1
         sed -i '/^#include <rte_lpm\.h>$/d' lib/common/cksum.c || exit 1
         rm -rf build
-        meson setup build --prefix="$PKTGEN_PREFIX" --libdir=lib || exit 1
+        meson setup build --prefix="$PKTGEN_PREFIX" --libdir=lib "-Dc_link_args=-Wl,-rpath,$dpdk_libdir" || exit 1
         ninja -C build || exit 1
         ninja -C build install || exit 1
     ) || { echo "floodsd dpdk: build failed — see output above."; return 1; }
 
-    if [ ! -x "$PKTGEN_BIN" ] || ! grep -aqF 'floodsd mlx5 receive isolation v2' "$PKTGEN_BIN"; then
+    if [ ! -x "$PKTGEN_BIN" ] || ! grep -aqF 'floodsd mlx5 receive isolation v3' "$PKTGEN_BIN"; then
         echo "floodsd dpdk: protected Pktgen binary was not produced."
         return 1
     fi
@@ -1338,6 +1388,7 @@ _fd_dpdk_device() {
 # _floodsd_dpdk keeps mlx5 reception with Linux and launches Pktgen for TX.
 _floodsd_dpdk() {
     _fd_parse_dport "$@"
+    _fd_parse_multiport "$@"
     local iface destip destmac sourceif ifip master
     iface=$(_floodsd_get if); destip=$(_floodsd_get destip); destmac=$(_floodsd_get destmac)
     if [ -z "$iface" ] || [ -z "$destip" ] || [ -z "$destmac" ]; then
@@ -1423,6 +1474,11 @@ _floodsd_dpdk() {
     fi
     plan=$(_fd_lcore_plan "floodsd dpdk" "$ntx" "${#members[@]}") || return 1
     read -r lcores map cpus est <<< "$plan"
+    local mappings=() mapping_args=() mapping
+    IFS=, read -r -a mappings <<< "$map"
+    for mapping in "${mappings[@]}"; do
+        mapping_args+=(-m "$mapping")
+    done
     _floodsd_ensure_dpdk || return 1
     _floodsd_set dpdkcores "$ntx" || return 1
     if [ -n "$selection" ]; then
@@ -1449,7 +1505,7 @@ _floodsd_dpdk() {
     done
     if [ "$require_mlx5" = 1 ]; then
         local dpdk_version
-        dpdk_version=$(pkg-config --modversion libdpdk) || return 1
+        dpdk_version=$(_floodsd_dpdk_pkg_config --modversion libdpdk) || return 1
         case "$dpdk_version" in
             25.11|25.11.*) ;;
             *) echo "floodsd dpdk: zero receive rules has only been audited for DPDK 25.11, found $dpdk_version." >&2; return 1 ;;
@@ -1463,7 +1519,9 @@ _floodsd_dpdk() {
     # the plain `set` values — so every field must be given as a range (a
     # min==max==inc-0 range is a fixed field). sport increments by 1 and wraps
     # at max, giving an even round-robin across the port range.
-    local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + ${FLOOD_SPORT_CNT:-1} - 1))
+    local sport_cnt
+    sport_cnt=$(_fd_sport_cnt)
+    local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + sport_cnt - 1))
     local cmds="$FLOODSD_DPDK_CMDS"
     mkdir -p "$(dirname "$cmds")" || return 1
     for ((port=0; port<${#members[@]}; port++)); do
@@ -1479,14 +1537,14 @@ range $port src ip min ${ifip:-0.0.0.0}
 range $port src ip max ${ifip:-0.0.0.0}
 range $port src ip inc 0.0.0.0
 range $port proto udp
-range $port dport start $FLOOD_DPORT
-range $port dport min $FLOOD_DPORT
-range $port dport max $FLOOD_DPORT
-range $port dport inc 0
-range $port sport start $sport_lo
-range $port sport min $sport_lo
-range $port sport max $sport_hi
-range $port sport inc 1
+range $port dst port start $FLOOD_DPORT
+range $port dst port min $FLOOD_DPORT
+range $port dst port max $FLOOD_DPORT
+range $port dst port inc 0
+range $port src port start $sport_lo
+range $port src port min $sport_lo
+range $port src port max $sport_hi
+range $port src port inc 1
 range $port size start 64
 range $port size min 64
 range $port size max 64
@@ -1507,8 +1565,10 @@ EOF
     # ~/.local/bin from PATH. LD_LIBRARY_PATH is passed explicitly through
     # env since libpktgen.so lives in ~/.local/lib, outside the system
     # linker cache (sudo would otherwise reset the environment).
-    sudo env LD_LIBRARY_PATH="$PKTGEN_PREFIX/lib" FLOODSD_DPDK_PCI="$pci_list" FLOODSD_DPDK_MLX5="$require_mlx5" "$PKTGEN_BIN" \
-        --lcores "$lcores" -n 4 "${eal[@]}" --main-lcore 0 -- -m "$map" -f "$cmds"
+    local dpdk_libdir
+    dpdk_libdir=$(_floodsd_dpdk_pkg_config --variable=libdir libdpdk) || return 1
+    sudo env LD_LIBRARY_PATH="$dpdk_libdir:$PKTGEN_PREFIX/lib" FLOODSD_DPDK_PCI="$pci_list" FLOODSD_DPDK_MLX5="$require_mlx5" "$PKTGEN_BIN" \
+        --lcores "$lcores" -n 4 "${eal[@]}" --main-lcore 0 -- "${mapping_args[@]}" -f "$cmds"
 }
 
 # floodsd restore: undo whatever `floodsd dpdk` did to hand the NIC over —
