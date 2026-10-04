@@ -34,9 +34,8 @@
 # (pktgen driving one directly tends to surface as skb/protocol errors
 # rather than a clean failure) — so if the saved target is a bond master,
 # both engines prompt for one of its slaves to actually flood from instead
-# (see _fd_bond_pick_slave). If that slave is still enslaved, `floodsd dpdk`
-# offers to pull it out of the bond first and `floodsd restore` puts it back
-# (see _fd_bond_detach/_fd_bond_reattach).
+# (see _fd_bond_pick_slave). mlx5 members stay attached to the bond, with
+# Pktgen receive isolation enabled before port configuration.
 #
 # `floodsd setup` resolves and saves the target once: pick the sending NIC,
 # enter the destination IP, then floodsd sends it a UDP probe (source port
@@ -150,7 +149,7 @@ _fd_pick_iface() {
     local ifaces=() i idx=1 drv bondtag state statetag
     echo "Available interfaces:" >&2
     for i in /sys/class/net/*; do
-        [ -e "$i" ] || continue
+        [ -d "$i" ] || continue
         i=${i##*/}
         [ "$i" = lo ] && continue
         drv=$(basename "$(readlink -f "/sys/class/net/$i/device/driver" 2>/dev/null)" 2>/dev/null)
@@ -182,42 +181,35 @@ _fd_pick_iface() {
     echo "${ifaces[$((sel - 1))]}"
 }
 
-# _fd_is_mellanox <iface> <curdrv>: detects (and lets the user confirm/
-# override) whether <iface> is a bifurcated Mellanox PMD — DPDK drives it
-# while it stays on the kernel driver, so it never needs a vfio-pci rebind.
-_fd_is_mellanox() {
-    local iface=$1 curdrv=$2 mellanox=0
-    case "$curdrv" in mlx5_core|mlx5) mellanox=1 ;; esac
-    local defans; [ "$mellanox" = 1 ] && defans=Y || defans=N
-    [ -n "$curdrv" ] && echo "Detected kernel driver for $iface: $curdrv"
-    local ans
-    read -rp "Mellanox/mlx5 NIC (no vfio-pci rebind needed)? [$defans]: " ans
-    ans=${ans:-$defans}
-    case "$ans" in y|Y|yes|Yes) return 0 ;; *) return 1 ;; esac
-}
-
 # _fd_lcore_plan selects the highest available CPUs for DPDK.
-# It prints the main CPU, RX CPU, TX CPU list, full CPU list, Pktgen mapping
-# and estimated throughput.
+# Logical lcores are contiguous even when the permitted CPUs have gaps.
 _fd_lcore_plan() {
     if ! command -v python3 >/dev/null 2>&1; then
         echo "$1: python3 is required to select available CPUs." >&2
         return 1
     fi
-    python3 - "$1" "$2" <<'PYEOF'
+    python3 - "$1" "$2" "${3:-1}" <<'PYEOF'
 import os, sys
 
-prefix, tx_cnt = sys.argv[1], int(sys.argv[2])
+prefix, tx_cnt, port_cnt = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 cpus = sorted(os.sched_getaffinity(0))
-if tx_cnt < 1 or tx_cnt + 2 > len(cpus):
-    sys.exit(f"{prefix}: {tx_cnt} TX cores need {tx_cnt + 2} available CPUs, but only {len(cpus)} are allowed. Choose fewer TX cores.")
+core_cnt = tx_cnt + port_cnt + 1
+if port_cnt < 1 or tx_cnt < port_cnt:
+    sys.exit(f"{prefix}: each selected port needs at least one TX core.")
+if core_cnt > len(cpus) or core_cnt > 128:
+    sys.exit(f"{prefix}: need {core_cnt} available CPUs, but only {min(len(cpus), 128)} can be used. Choose fewer TX cores.")
 
-selected = cpus[-(tx_cnt + 2):]
-main, rxcore = selected[-1], selected[-2]
-txcores = ','.join(str(cpu) for cpu in selected[:-2])
-lcores = ','.join(str(cpu) for cpu in selected)
-mapping = f"[{rxcore}:{txcores.replace(',', '/')}].0"
-print(main, rxcore, txcores, lcores, mapping, tx_cnt * 30)
+selected = list(reversed(cpus[-core_cnt:]))
+lcores = ','.join(f'{lid}@{cpu}' for lid, cpu in enumerate(selected))
+mapping, tx_start = [], port_cnt + 1
+for port in range(port_cnt):
+    tx_queues = tx_cnt // port_cnt + (port < tx_cnt % port_cnt)
+    tx_end = tx_start + tx_queues - 1
+    tx_range = str(tx_start) if tx_start == tx_end else f'{tx_start}-{tx_end}'
+    mapping.append(f'[{port + 1}:{tx_range}].{port}')
+    tx_start = tx_end + 1
+cpu_list = ','.join(str(cpu) for cpu in selected)
+print(lcores, ','.join(mapping), cpu_list, tx_cnt * 30)
 PYEOF
 }
 
@@ -245,35 +237,54 @@ _fd_check_numa() {
 _fd_reserve_hugepages() {
     local ntx=$1
     local npages=$(( 1024 * ntx ))
-    echo "Reserving $npages x 2MB hugepages ($((npages * 2)) MiB)..."
-    echo "$npages" | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null
+    local current available required
+    current=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) || return 1
+    available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) || return 1
+    [[ "$current" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || return 1
+    required=$(( (npages - current) * 2048 ))
+    if [ "$required" -gt 0 ]; then
+        if [ "$required" -gt "$((available * 3 / 4))" ] || [ "$((available - required))" -lt 1048576 ]; then
+            echo "floodsd dpdk: insufficient memory headroom for $((npages * 2)) MiB of hugepages." >&2
+            return 1
+        fi
+        echo "Reserving $npages x 2MB hugepages ($((npages * 2)) MiB)..."
+        echo "$npages" | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null || return 1
+        current=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) || return 1
+        [ "$current" -ge "$npages" ] || { echo "floodsd dpdk: hugepage allocation was incomplete." >&2; return 1; }
+    fi
     if ! grep -q 'hugetlbfs.*pagesize=2M' /proc/mounts; then
-        sudo mkdir -p /mnt/huge && sudo mount -t hugetlbfs -o pagesize=2M nodev /mnt/huge
+        sudo mkdir -p /mnt/huge && sudo mount -t hugetlbfs -o pagesize=2M nodev /mnt/huge || return 1
     fi
 }
 
 # _fd_vfio_bind <tool> <iface> <pci> <curdrv> <statefile> [peer] [ip]: binds
 # <iface> to vfio-pci for DPDK and records pci/drv/if/ip/peer in <statefile>
 # so _fd_vfio_restore can undo it later. Only call this for non-Mellanox
-# NICs (see _fd_is_mellanox) — Mellanox never needs rebinding.
+# NICs, mlx5 never needs rebinding.
 _fd_vfio_bind() {
     local tool=$1 iface=$2 pci=$3 curdrv=$4 state=$5 peer=$6 ip=$7
+    if ! [[ "$pci" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] ||
+       [ ! -d "/sys/bus/pci/devices/$pci" ] || [ -z "$curdrv" ] || [ -e "$state" ]; then
+        echo "$tool: invalid PCI device or existing VFIO ownership record." >&2
+        return 1
+    fi
+    case "$curdrv" in mlx5_core|mlx5) echo "$tool: refusing to bind mlx5 to vfio-pci." >&2; return 1 ;; esac
     echo "Binding $iface ($pci, ${curdrv:-unknown}) to vfio-pci for DPDK..."
-    sudo modprobe vfio-pci 2>/dev/null
+    sudo modprobe vfio-pci || return 1
     if ! ls /sys/kernel/iommu_groups/* >/dev/null 2>&1; then
-        echo "  NOTE: no IOMMU groups found. vfio-pci needs an IOMMU (boot with 'intel_iommu=on iommu=pt'),"
-        echo "        or enable no-IOMMU mode: echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode"
+        echo "$tool: vfio-pci requires an enabled IOMMU." >&2
+        return 1
     fi
+    mkdir -p "$(dirname "$state")" || return 1
+    printf 'pci=%s\ndrv=%s\nif=%s\nip=%s\npeer=%s\n' "$pci" "$curdrv" "$iface" "$ip" "$peer" > "$state" || return 1
     if command -v dpdk-devbind.py >/dev/null 2>&1; then
-        sudo dpdk-devbind.py --bind=vfio-pci "$pci"
+        sudo dpdk-devbind.py --bind=vfio-pci "$pci" || return 1
     else
-        echo vfio-pci | sudo tee "/sys/bus/pci/devices/$pci/driver_override" >/dev/null
-        [ -e "/sys/bus/pci/devices/$pci/driver" ] && \
-            echo "$pci" | sudo tee "/sys/bus/pci/devices/$pci/driver/unbind" >/dev/null
-        echo "$pci" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
+        echo vfio-pci | sudo tee "/sys/bus/pci/devices/$pci/driver_override" >/dev/null || return 1
+        echo "$pci" | sudo tee "/sys/bus/pci/devices/$pci/driver/unbind" >/dev/null || return 1
+        echo "$pci" | sudo tee /sys/bus/pci/drivers_probe >/dev/null || return 1
     fi
-    mkdir -p "$(dirname "$state")"
-    printf 'pci=%s\ndrv=%s\nif=%s\nip=%s\npeer=%s\n' "$pci" "$curdrv" "$iface" "$ip" "$peer" > "$state"
+    [ "$(basename "$(readlink "/sys/bus/pci/devices/$pci/driver")")" = vfio-pci ] || return 1
     echo "  To rebind the kernel driver + restore $iface later:  $tool restore"
 }
 
@@ -344,46 +355,7 @@ _fd_vfio_restore() {
     [ -n "$peer" ] && echo "  $peer link restored."
 }
 
-# _fd_bond_detach <iface>: if <iface> is currently an active bonding slave,
-# offers to remove it from its bond before DPDK takes it over — DPDK's
-# pktgen talks to the NIC directly (or, for vfio-pci NICs, needs the kernel
-# driver detached entirely), and leaving it enslaved means the bonding
-# driver is still trying to use the same NIC for kernel traffic underneath
-# DPDK, corrupting both. Records <iface>/<bond> in $FLOODSD_BOND_STATE
-# (independent of $FLOODSD_VFIO_STATE, since Mellanox NICs skip vfio
-# binding entirely but still need to be re-enslaved on restore) so
-# `floodsd restore` can re-add it afterward.
-_fd_bond_detach() {
-    local iface=$1 master
-    master=$(readlink "/sys/class/net/$iface/master" 2>/dev/null)
-    [ -z "$master" ] && return 0
-    master=${master##*/}
-
-    echo "'$iface' is currently enslaved to bond '$master'."
-    local ans
-    read -rp "Remove it from the bond before using it for DPDK? [Y/n]: " ans
-    case "${ans:-Y}" in
-        n|N|no|No)
-            echo "floodsd dpdk: leaving '$iface' enslaved to '$master' — expect vfio-pci bind failures or a destabilized bond."
-            return 0
-            ;;
-    esac
-
-    echo "Removing $iface from bond $master..."
-    echo "-$iface" | sudo tee "/sys/class/net/$master/bonding/slaves" >/dev/null
-    # Verify the release actually took rather than assuming the sysfs write
-    # worked — same reasoning as _fd_kernel_cleanup_all's post-write check.
-    if [ -n "$(readlink "/sys/class/net/$iface/master" 2>/dev/null)" ]; then
-        echo "  WARNING: '$iface' still shows as enslaved to '$master' after asking the bond to release it — DPDK may still conflict with it."
-    fi
-    mkdir -p "$(dirname "$FLOODSD_BOND_STATE")"
-    printf 'if=%s\nbond=%s\n' "$iface" "$master" > "$FLOODSD_BOND_STATE"
-    echo "  Recorded — 'floodsd restore' will re-add it to '$master' afterward."
-}
-
-# _fd_bond_reattach: undoes _fd_bond_detach — re-adds the recorded interface
-# to its bond. Run after _fd_vfio_restore (if that ran at all — Mellanox
-# NICs never get vfio-bound, so this is often the only restore step needed).
+# _fd_bond_reattach restores bond membership recorded by older floodsd versions.
 _fd_bond_reattach() {
     [ -f "$FLOODSD_BOND_STATE" ] || return 1
     local iface bond k v
@@ -1178,10 +1150,92 @@ _floodsd_stop() {
 PKTGEN_SRC_DIR="$HOME/.local/src/pktgen-dpdk"
 PKTGEN_PREFIX="$HOME/.local"
 PKTGEN_BIN="$PKTGEN_PREFIX/bin/pktgen"
-_floodsd_ensure_dpdk() {
-    [ -x "$PKTGEN_BIN" ] && return 0
 
-    echo "floodsd dpdk: '$PKTGEN_BIN' not found."
+# _floodsd_patch_pktgen isolates mlx5 reception before configuring any port.
+_floodsd_patch_pktgen() {
+    python3 - <<'PYEOF'
+from pathlib import Path
+
+path = Path('app/pktgen-port-cfg.c')
+source = path.read_text()
+if 'floodsd_prepare_ports' in source:
+    raise SystemExit('floodsd dpdk: Pktgen source already has a local startup patch.')
+def replace(old, new):
+    global source
+    if source.count(old) != 1:
+        raise SystemExit('floodsd dpdk: unsupported Pktgen source, refusing an unsafe build.')
+    source = source.replace(old, new)
+
+replace('#include <rte_dev.h>', '#include <rte_dev.h>\n#include <rte_flow.h>')
+replace('static void\n_mtu_defaults(', r'''static int
+floodsd_is_mlx5(const char *driver)
+{
+    return driver && (!strcmp(driver, "mlx5_pci") || !strcmp(driver, "net_mlx5"));
+}
+
+static void
+_mtu_defaults(''')
+replace('void\npktgen_config_ports(void)', r'''static void
+floodsd_prepare_ports(void)
+{
+    const char *requested = getenv("FLOODSD_DPDK_PCI");
+    const char *require_mlx5 = getenv("FLOODSD_DPDK_MLX5");
+    char *devices, *next, *expected;
+    uint16_t pid;
+
+    if (!requested || !*requested)
+        rte_exit(EXIT_FAILURE, "Launch this protected Pktgen through floodsd.\n");
+    devices = strdup(requested);
+    if (!devices)
+        rte_exit(EXIT_FAILURE, "Cannot allocate requested device list.\n");
+    expected = strtok_r(devices, ",", &next);
+    RTE_ETH_FOREACH_DEV(pid) {
+        struct rte_eth_dev_info info;
+        struct rte_flow_error error = {0};
+
+        if (rte_eth_dev_info_get(pid, &info) || !info.device ||
+            !expected || strcmp(rte_dev_name(info.device), expected))
+            rte_exit(EXIT_FAILURE, "Probed ports differ from requested PCI devices.\n");
+        if (require_mlx5 && !strcmp(require_mlx5, "1") && !floodsd_is_mlx5(info.driver_name))
+            rte_exit(EXIT_FAILURE, "Requested mlx5 device has an unexpected DPDK driver.\n");
+        if (floodsd_is_mlx5(info.driver_name)) {
+            if (rte_flow_isolate(pid, 1, &error))
+                rte_exit(EXIT_FAILURE, "Cannot isolate mlx5 RX on port %u, %s.\n",
+                         pid, error.message ? error.message : "unsupported");
+            pktgen_log_info("floodsd mlx5 receive isolation v2, port %u", pid);
+        }
+        expected = strtok_r(NULL, ",", &next);
+    }
+    if (expected)
+        rte_exit(EXIT_FAILURE, "Not all requested PCI devices were probed.\n");
+    free(devices);
+}
+
+void
+pktgen_config_ports(void)''')
+replace('    /* Setup the number of ports to display at a time */',
+        '    floodsd_prepare_ports();\n\n    /* Setup the number of ports to display at a time */')
+replace('    conf->rxmode.mtu = pinfo->max_mtu;', r'''    if (floodsd_is_mlx5(dinfo->driver_name)) {
+        uint16_t mtu;
+        if (rte_eth_dev_get_mtu(pinfo->pid, &mtu))
+            rte_exit(EXIT_FAILURE, "Cannot read mlx5 host MTU.\n");
+        pinfo->max_mtu = mtu;
+    }
+    conf->rxmode.mtu = pinfo->max_mtu;''')
+replace('    if (max_mtu < dinfo->min_mtu) {',
+        '    if (floodsd_is_mlx5(pinfo->dev_info.driver_name))\n'
+        '        return;\n\n'
+        '    if (max_mtu < dinfo->min_mtu) {')
+path.write_text(source)
+PYEOF
+}
+
+_floodsd_ensure_dpdk() {
+    if [ -x "$PKTGEN_BIN" ] && grep -aqF 'floodsd mlx5 receive isolation v2' "$PKTGEN_BIN"; then
+        return 0
+    fi
+
+    echo "floodsd dpdk: building Pktgen with mlx5 receive isolation."
     echo "  This installs DPDK's dev packages via the system package manager (the"
     echo "  one system-wide step — no user-dir equivalent), then clones + builds"
     echo "  Pktgen-DPDK from source into $PKTGEN_SRC_DIR, installed to $PKTGEN_PREFIX."
@@ -1242,95 +1296,166 @@ _floodsd_ensure_dpdk() {
     echo "Building Pktgen-DPDK (meson + ninja), installing to $PKTGEN_PREFIX..."
     (
         cd "$PKTGEN_SRC_DIR" || exit 1
-        # Pktgen's unused LPM include breaks with some packaged DPDK builds.
-        if [ -f lib/common/cksum.c ] && grep -q '^#include <rte_lpm\.h>$' lib/common/cksum.c; then
-            local cksum_backup
-            cksum_backup=$(mktemp "$(dirname "$PKTGEN_SRC_DIR")/pktgen-cksum.XXXXXX") || exit 1
-            cp -p lib/common/cksum.c "$cksum_backup" || { rm -f "$cksum_backup"; exit 1; }
-            trap 'cp -p "$cksum_backup" lib/common/cksum.c && rm -f "$cksum_backup" || exit 1' EXIT
-            sed -i '/^#include <rte_lpm\.h>$/d' lib/common/cksum.c || exit 1
-        fi
+        local backup
+        backup=$(mktemp -d "$(dirname "$PKTGEN_SRC_DIR")/pktgen-build.XXXXXX") || exit 1
+        cp -p app/pktgen-port-cfg.c "$backup/port.c" && cp -p lib/common/cksum.c "$backup/cksum.c" || exit 1
+        trap 'cp -p "$backup/port.c" app/pktgen-port-cfg.c && cp -p "$backup/cksum.c" lib/common/cksum.c && rm -rf "$backup" || exit 1' EXIT
+        _floodsd_patch_pktgen || exit 1
+        sed -i '/^#include <rte_lpm\.h>$/d' lib/common/cksum.c || exit 1
         rm -rf build
         meson setup build --prefix="$PKTGEN_PREFIX" --libdir=lib || exit 1
         ninja -C build || exit 1
         ninja -C build install || exit 1
     ) || { echo "floodsd dpdk: build failed — see output above."; return 1; }
 
-    if [ ! -x "$PKTGEN_BIN" ]; then
-        echo "floodsd dpdk: build reported success but $PKTGEN_BIN wasn't produced."
+    if [ ! -x "$PKTGEN_BIN" ] || ! grep -aqF 'floodsd mlx5 receive isolation v2' "$PKTGEN_BIN"; then
+        echo "floodsd dpdk: protected Pktgen binary was not produced."
         return 1
     fi
     echo "pktgen installed: $PKTGEN_BIN"
 }
 
-# floodsd dpdk: bind the flood NIC to vfio-pci (skipped for Mellanox) and
-# launch DPDK pktgen aimed at the saved target. Same core-layout convention
-# as pktfd: main lcore highest, then RX, then TX cores going down — DPDK's
-# main lcore runs control/CLI (no traffic) and pktgen dedicates one core to
-# RX; every other core is TX (generation), and TX throughput scales with
-# their count. Leaves you at pktgen's interactive prompt — 'start 0' and
-# rate-limiting ('set 0 rate <pct>') are yours to run by hand.
+# _fd_dpdk_device checks the interface and PCI address before privileged setup.
+_fd_dpdk_device() {
+    local iface=$1 device driver node
+    if [ ! -d "/sys/class/net/$iface" ]; then
+        echo "floodsd dpdk: interface '$iface' does not exist." >&2
+        return 1
+    fi
+    device=$(readlink -f "/sys/class/net/$iface/device") || return 1
+    device=${device##*/}
+    driver=$(readlink -f "/sys/class/net/$iface/device/driver") || return 1
+    driver=${driver##*/}
+    if ! [[ "$device" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] ||
+       [ ! -d "/sys/bus/pci/devices/$device" ] || [ ! -L "/sys/class/net/$iface/device/driver" ]; then
+        echo "floodsd dpdk: '$iface' has no bound PCI device." >&2
+        return 1
+    fi
+    node=$(cat "/sys/class/net/$iface/device/numa_node") || return 1
+    printf '%s %s %s\n' "$device" "$driver" "$node"
+}
+
+# _floodsd_dpdk keeps mlx5 reception with Linux and launches Pktgen for TX.
 _floodsd_dpdk() {
     _fd_parse_dport "$@"
-    local iface destip destmac
+    local iface destip destmac sourceif ifip master
     iface=$(_floodsd_get if); destip=$(_floodsd_get destip); destmac=$(_floodsd_get destmac)
     if [ -z "$iface" ] || [ -z "$destip" ] || [ -z "$destmac" ]; then
         echo "floodsd dpdk: no target configured — run 'floodsd setup' first."
         return 1
     fi
 
-    local curcores ntx
-    curcores=$(_floodsd_get dpdkcores); curcores=${curcores:-1}
-    echo "DPDK uses 1 lcore for control + 1 for RX; each extra TX core adds ~30 Mpps (64B)."
+    if [ ! -d "/sys/class/net/$iface" ]; then
+        echo "floodsd dpdk: interface '$iface' does not exist. Check 'floodsd restore'." >&2
+        return 1
+    fi
+    if [ -e "$FLOODSD_VFIO_STATE" ] || [ -e "$FLOODSD_BOND_STATE" ]; then
+        echo "floodsd dpdk: previous driver or bond changes need 'floodsd restore' first." >&2
+        return 1
+    fi
+
+    sourceif=$iface
+    master=$(readlink "/sys/class/net/$iface/master" 2>/dev/null) || master=""
+    [ -n "$master" ] && sourceif=${master##*/}
+    local members=("$iface") slave selection=""
+    if [ -d "/sys/class/net/$iface/bonding" ]; then
+        slave=$(_fd_bond_pick_slave "$iface" "$(_floodsd_get dpdkslave)") || return 1
+        selection=$slave
+        if [ "$slave" = ALL ]; then
+            read -r -a members < "/sys/class/net/$iface/bonding/slaves" || return 1
+        else
+            members=("$slave")
+        fi
+        [ "${#members[@]}" -gt 0 ] || return 1
+        for slave in "${members[@]}"; do
+            master=$(readlink "/sys/class/net/$slave/master") || return 1
+            if [ "${master##*/}" != "$iface" ]; then
+                echo "floodsd dpdk: '$slave' is no longer a member of '$iface'." >&2
+                return 1
+            fi
+        done
+    fi
+
+    local rows=() pcis=() drivers=() nodes=() pci curdrv nicnode row address previous flags
+    for slave in "${members[@]}"; do
+        row=$(_fd_dpdk_device "$slave") || return 1
+        read -r pci curdrv nicnode <<< "$row"
+        for previous in "${rows[@]}"; do
+            if [ "${previous%% *}" = "$pci" ]; then
+                echo "floodsd dpdk: selected interfaces share PCI device '$pci'." >&2
+                return 1
+            fi
+        done
+        rows+=("$pci $slave $curdrv $nicnode")
+        case "$curdrv" in
+            mlx5_core|mlx5)
+                flags=$(cat "/sys/class/net/$slave/flags") || return 1
+                if ! [[ "$flags" =~ ^0x[0-9a-fA-F]+$ ]] || [ "$((flags & 1))" -eq 0 ]; then
+                    echo "floodsd dpdk: mlx5 interface '$slave' must already be administratively up." >&2
+                    return 1
+                fi
+                ;;
+            *)
+                master=$(readlink "/sys/class/net/$slave/master" 2>/dev/null) || master=""
+                address=$(ip -o addr show dev "$slave" scope global) || return 1
+                if [ "${#members[@]}" -ne 1 ] || [ -n "$master" ] || [ -n "$address" ]; then
+                    echo "floodsd dpdk: VFIO requires a dedicated interface with no host addresses or master." >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+    # Match DPDK's PCI enumeration order when assigning port numbers.
+    members=()
+    while read -r pci slave curdrv nicnode; do
+        pcis+=("$pci"); members+=("$slave"); drivers+=("$curdrv"); nodes+=("$nicnode")
+    done < <(printf '%s\n' "${rows[@]}" | LC_ALL=C sort)
+
+    ifip=$(ip -4 -o addr show dev "$sourceif" | awk 'NR==1 {split($4, ip, "/"); print ip[1]}') || return 1
+    local curcores ntx plan lcores map cpus est
+    curcores=$(_floodsd_get dpdkcores); curcores=${curcores:-${#members[@]}}
+    echo "DPDK uses 1 control core, ${#members[@]} RX core(s), and the requested TX cores."
     read -rp "How many TX (generation) cores? [${curcores}] " ntx
     ntx=${ntx:-$curcores}
     if ! [[ "$ntx" =~ ^[0-9]+$ ]] || [ "$ntx" -lt 1 ]; then
-        echo "floodsd dpdk: invalid TX core count '$ntx'."
+        echo "floodsd dpdk: invalid TX core count '$ntx'." >&2
         return 1
     fi
-    _floodsd_set dpdkcores "$ntx"
-
-    local plan main rxcore txcores lcores map est
-    plan=$(_fd_lcore_plan "floodsd dpdk" "$ntx") || return 1
-    read -r main rxcore txcores lcores map est <<< "$plan"
-
+    plan=$(_fd_lcore_plan "floodsd dpdk" "$ntx" "${#members[@]}") || return 1
+    read -r lcores map cpus est <<< "$plan"
     _floodsd_ensure_dpdk || return 1
-    if [ ! -e "/sys/class/net/$iface" ]; then
-        echo "floodsd dpdk: no netdev for '$iface' — already bound to vfio-pci from a previous run? Check 'floodsd restore'."
-        return 1
+    _floodsd_set dpdkcores "$ntx" || return 1
+    if [ -n "$selection" ]; then
+        _floodsd_set dpdkslave "$selection" || return 1
     fi
-
-    if [ -d "/sys/class/net/$iface/bonding" ]; then
-        # A bond has no PCI device for DPDK to bind — flood from one of its
-        # slaves instead (which does).
-        local bondiface="$iface" slave
-        slave=$(_fd_bond_pick_slave "$bondiface" "$(_floodsd_get dpdkslave)") || return 1
-        _floodsd_set dpdkslave "$slave"
-        echo "Flooding via '$slave' — '$bondiface' itself has no PCI device for DPDK to bind."
-        iface="$slave"
+    local port pci_list="" require_mlx5=0 eal=()
+    for ((port=0; port<${#members[@]}; port++)); do
+        row=$(_fd_dpdk_device "${members[port]}") || return 1
+        if [ "$row" != "${pcis[port]} ${drivers[port]} ${nodes[port]}" ]; then
+            echo "floodsd dpdk: device changed during setup." >&2
+            return 1
+        fi
+        pci_list+="${pci_list:+,}${pcis[port]}"
+        case "${drivers[port]}" in
+            mlx5_core|mlx5)
+                # HWS avoids the legacy probe-time receive-rule tests.
+                eal+=(-a "${pcis[port]},dv_flow_en=2,dv_esw_en=0,fdb_def_rule_en=0,lacp_by_user=1,dv_xmeta_en=0")
+                require_mlx5=1
+                ;;
+            *) eal+=(-a "${pcis[port]}") ;;
+        esac
+        _fd_check_numa "floodsd dpdk" "${members[port]}" "${nodes[port]}" "$cpus"
+        echo "Port $port, ${members[port]} (${pcis[port]}, ${drivers[port]})"
+    done
+    if [ "$require_mlx5" = 1 ]; then
+        local dpdk_version
+        dpdk_version=$(pkg-config --modversion libdpdk) || return 1
+        case "$dpdk_version" in
+            25.11|25.11.*) ;;
+            *) echo "floodsd dpdk: zero receive rules has only been audited for DPDK 25.11, found $dpdk_version." >&2; return 1 ;;
+        esac
     fi
-
-    _fd_bond_detach "$iface"
-
-    local pci nicnode curdrv ifip
-    pci=$(basename "$(readlink -f /sys/class/net/$iface/device)")
-    nicnode=$(cat /sys/class/net/$iface/device/numa_node 2>/dev/null)
-    curdrv=$(basename "$(readlink -f /sys/class/net/$iface/device/driver)" 2>/dev/null)
-    ifip=$(ip -4 -o addr show dev "$iface" | awk '{print $4}' | head -1)
-
-    local mellanox=0
-    _fd_is_mellanox "$iface" "$curdrv" && mellanox=1
-
-    _fd_check_numa "floodsd dpdk" "$iface" "$nicnode" "$lcores"
-
-    echo "DPDK pktgen core plan on $iface:"
-    echo "  $main    main lcore (DPDK control/CLI — no traffic)"
-    echo "  $rxcore    RX core"
-    echo "  $txcores  TX core(s) x$ntx  ->  ~${est} Mpps max (rough 30 Mpps/core guide, capped by NIC line rate)"
-
-    _fd_reserve_hugepages "$ntx"
-
-    [ "$mellanox" != 1 ] && _fd_vfio_bind floodsd "$iface" "$pci" "$curdrv" "$FLOODSD_VFIO_STATE" "" "$ifip"
+    echo "DPDK CPUs $cpus, queue mapping $map"
 
     # Source-port rotation: sweep FLOOD_SPORT .. FLOOD_SPORT+FLOOD_SPORT_CNT-1
     # so the target's NIC hashes the flood across its RX queues / net tiles.
@@ -1340,48 +1465,55 @@ _floodsd_dpdk() {
     # at max, giving an even round-robin across the port range.
     local sport_lo=$FLOOD_SPORT sport_hi=$((FLOOD_SPORT + ${FLOOD_SPORT_CNT:-1} - 1))
     local cmds="$FLOODSD_DPDK_CMDS"
-    mkdir -p "$(dirname "$cmds")"
-    cat > "$cmds" <<EOF
-disable 0 vlan
-range 0 dst mac start $destmac
-range 0 dst ip start $destip
-range 0 dst ip min $destip
-range 0 dst ip max $destip
-range 0 dst ip inc 0.0.0.0
-range 0 src ip start ${ifip:-0.0.0.0}
-range 0 src ip min ${ifip:-0.0.0.0}
-range 0 src ip max ${ifip:-0.0.0.0}
-range 0 src ip inc 0.0.0.0
-range 0 proto udp
-range 0 dport start $FLOOD_DPORT
-range 0 dport min $FLOOD_DPORT
-range 0 dport max $FLOOD_DPORT
-range 0 dport inc 0
-range 0 sport start $sport_lo
-range 0 sport min $sport_lo
-range 0 sport max $sport_hi
-range 0 sport inc 1
-range 0 size start 64
-range 0 size min 64
-range 0 size max 64
-range 0 size inc 0
-enable 0 range
+    mkdir -p "$(dirname "$cmds")" || return 1
+    for ((port=0; port<${#members[@]}; port++)); do
+        cat <<EOF
+disable $port vlan
+range $port dst mac start $destmac
+range $port dst ip start $destip
+range $port dst ip min $destip
+range $port dst ip max $destip
+range $port dst ip inc 0.0.0.0
+range $port src ip start ${ifip:-0.0.0.0}
+range $port src ip min ${ifip:-0.0.0.0}
+range $port src ip max ${ifip:-0.0.0.0}
+range $port src ip inc 0.0.0.0
+range $port proto udp
+range $port dport start $FLOOD_DPORT
+range $port dport min $FLOOD_DPORT
+range $port dport max $FLOOD_DPORT
+range $port dport inc 0
+range $port sport start $sport_lo
+range $port sport min $sport_lo
+range $port sport max $sport_hi
+range $port sport inc 1
+range $port size start 64
+range $port size min 64
+range $port size max 64
+range $port size inc 0
+enable $port range
 EOF
+    done > "$cmds" || return 1
 
-    echo "Launching pktgen on $iface ($pci) -> $destip:$FLOOD_DPORT ($destmac), lcores $lcores (main $main)..."
-    echo "(pktgen drops you at its interactive prompt — run 'start 0' yourself when ready.)"
+    _fd_reserve_hugepages "$ntx" || return 1
+    case "${drivers[0]}" in
+        mlx5_core|mlx5) ;;
+        *) _fd_vfio_bind floodsd "${members[0]}" "${pcis[0]}" "${drivers[0]}" "$FLOODSD_VFIO_STATE" "" "$ifip" || return 1 ;;
+    esac
+
+    echo "Launching pktgen -> $destip:$FLOOD_DPORT ($destmac)..."
+    echo "(run 'start all' yourself when ready.)"
     # Absolute path (not just "pktgen"): sudo's secure_path typically strips
     # ~/.local/bin from PATH. LD_LIBRARY_PATH is passed explicitly through
     # env since libpktgen.so lives in ~/.local/lib, outside the system
     # linker cache (sudo would otherwise reset the environment).
-    sudo env LD_LIBRARY_PATH="$PKTGEN_PREFIX/lib" "$PKTGEN_BIN" -l "$lcores" -n 4 -a "$pci" --main-lcore "$main" -- -m "$map" -f "$cmds"
+    sudo env LD_LIBRARY_PATH="$PKTGEN_PREFIX/lib" FLOODSD_DPDK_PCI="$pci_list" FLOODSD_DPDK_MLX5="$require_mlx5" "$PKTGEN_BIN" \
+        --lcores "$lcores" -n 4 "${eal[@]}" --main-lcore 0 -- -m "$map" -f "$cmds"
 }
 
 # floodsd restore: undo whatever `floodsd dpdk` did to hand the NIC over —
 # rebind vfio-pci NICs to their kernel driver (see _fd_vfio_restore), and/or
-# re-add the NIC to its bond if _fd_bond_detach pulled it out of one
-# (Mellanox NICs skip the vfio-pci step entirely, so for those this bond
-# reattach is the only restore step there is).
+# re-add a NIC removed from its bond by an older version.
 _floodsd_restore() {
     local attempted=0 failed=0
     if [ -f "$FLOODSD_VFIO_STATE" ]; then
