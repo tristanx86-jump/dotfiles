@@ -140,6 +140,23 @@ create_symlink "$DOTFILES_DIR/zsh/.bashrc"        "$HOME/.bashrc"
 create_symlink "$DOTFILES_DIR/zsh/.bash_profile"  "$HOME/.bash_profile"
 create_symlink "$DOTFILES_DIR/tmux/.tmux.conf" "$HOME/.tmux.conf"
 
+seed_firedancer_config() {
+    local config_dir="$1"
+    local config_file="$config_dir/fdconfigs/placeholder.toml"
+    local selection_file="$config_dir/fdconfig"
+    mkdir -p "$config_dir/fdconfigs" || return 1
+    if [ ! -e "$config_file" ] && [ ! -L "$config_file" ]; then
+        cp "$DOTFILES_DIR/fdconfigs/placeholder.toml" "$config_file" || return 1
+        echo "[Config] Added placeholder Firedancer config."
+    fi
+    if [ ! -e "$selection_file" ] && [ ! -L "$selection_file" ]; then
+        printf '%s\n' placeholder > "$selection_file" || return 1
+        echo "[Config] Selected placeholder Firedancer config."
+    fi
+}
+
+seed_firedancer_config "$HOME/.config/dotfiles" || exit 1
+
 # sh reads .profile on interactive SSH logins.
 profile_file="$HOME/.profile"
 if [ ! -L "$profile_file" ] && ! grep -Fqx '# dotfiles zsh begin' "$profile_file" 2>/dev/null; then

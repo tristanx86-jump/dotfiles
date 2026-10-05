@@ -1,0 +1,27 @@
+[layout]
+net_tile_count = 1
+verify_tile_count = 3
+gossvf_tile_count = 2
+execle_tile_count = 1
+execrp_tile_count = 3
+snapdc_tile_count = 1
+
+[net]
+interface = "bond0"
+
+[development]
+alpenglow = true
+
+[development.pktgen]
+fake_dst_ip = "10.181.80.14"
+
+[tiles.gui]
+enabled = true
+gui_listen_address = "0.0.0.0"
+gui_listen_port = 8080
+max_http_connections = 16
+max_websocket_connections = 16
+send_buffer_size_mb = 256
+
+[tiles.metric]
+prometheus_listen_address = "0.0.0.0"
