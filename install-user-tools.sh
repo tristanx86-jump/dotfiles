@@ -26,7 +26,12 @@ case " ${ID:-} ${ID_LIKE:-} " in
         else
             package_manager=yum
         fi
-        tool_packages=(zsh git curl tar ripgrep fd-find python3.11 cmake
+        python_package=python3
+        # RHEL 8 and 9 need a newer Python for Firedancer's code generators.
+        case "${PLATFORM_ID:-}" in
+            platform:el8|platform:el9) python_package=python3.11 ;;
+        esac
+        tool_packages=(zsh git curl tar ripgrep fd-find "$python_package" cmake
                        clang clang-tools-extra cppcheck pkgconf-pkg-config
                        make tmux htop btop gdb xclip numactl)
         _package_installed() { rpm -q "$1" >/dev/null 2>&1; }
