@@ -12,7 +12,7 @@ case " ${ID:-} ${ID_LIKE:-} " in
     *" debian "*|*" ubuntu "*)
         package_family=debian
         package_manager=apt-get
-        tool_packages=(zsh git curl tar ripgrep fd-find python3.11 cmake
+        tool_packages=(zsh git curl tar ripgrep fd-find python3 cmake
                        clang clangd cppcheck pkg-config make tmux
                        htop btop gdb xclip numactl)
         _package_installed() {
