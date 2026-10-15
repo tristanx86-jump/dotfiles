@@ -47,6 +47,8 @@
 # routed hop away (see _fd_nexthop_ip) — when routed, the router's MAC gets
 # resolved and used at L2 while the target's real IP still goes in the IP
 # header, exactly like normal routing.
+# For a destination IP assigned to another local interface, setup reads that
+# interface's MAC directly. This does not check the physical connection.
 #
 # `floodsd setup-srcport` overrides the default source port (8424) if this
 # box's egress firewall pins a different one — run it before `floodsd setup`
@@ -491,12 +493,8 @@ _fd_nexthop_ip() {
     }'
 }
 
-# floodsd setup: pick the sending NIC, take a destination IP, resolve the
-# real L2 next hop (see _fd_nexthop_ip — the target itself if on-link, or a
-# router if routed), then send a UDP probe (see _fd_udp_probe) and read the
-# resolved MAC out of the neighbor table. The probe doubles as a
-# reachability check — if no ARP entry ever resolves, something's wrong with
-# routing/cabling before you ever get to flooding.
+# _floodsd_setup reads the destination MAC from another local interface or
+# resolves the next hop through ARP for a remote destination.
 _floodsd_setup() {
     _fd_parse_multiport "$@"
     local iface
@@ -535,6 +533,29 @@ _floodsd_setup() {
     destip=${destip:-$curdestip}
     [ -z "$destip" ] && { echo "floodsd setup: no destination IP given."; return 1; }
 
+    local destif destmac
+    destif=$(ip -4 -o addr show | awk -v destip="$destip" '{
+        split($4, addr, "/")
+        if (addr[1] == destip) { sub(/@.*/, "", $2); print $2; exit }
+    }')
+    if [ -n "$destif" ]; then
+        if [ "$destif" = "$iface" ] || [ "$destif" = "$probeif" ]; then
+            echo "floodsd setup: $destip belongs to the sending interface '$probeif'. Choose the receiving interface's IP."
+            return 1
+        fi
+        if [ "$(cat "/sys/class/net/$destif/type")" != 1 ]; then
+            echo "floodsd setup: local destination interface '$destif' is not Ethernet."
+            return 1
+        fi
+        destmac=$(cat "/sys/class/net/$destif/address") || return 1
+        _floodsd_set if "$iface"
+        _floodsd_set destip "$destip"
+        _floodsd_set destmac "$destmac"
+        echo "Target saved: $destip on local interface $destif ($destmac) -- flooding from $iface."
+        echo "Using the local interface's MAC directly. Physical connectivity has not been checked."
+        return 0
+    fi
+
     local nexthop
     nexthop=$(_fd_nexthop_ip "$probeif" "$destip")
     if [ -z "$nexthop" ]; then
@@ -556,7 +577,7 @@ _floodsd_setup() {
         return 1
     fi
 
-    local destmac tries
+    local tries
     for tries in 1 2 3 4 5 6; do
         destmac=$(ip neigh show "$nexthop" dev "$probeif" 2>/dev/null | awk '/lladdr/{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}' | head -1)
         [ -n "$destmac" ] && break
